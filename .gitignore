@@ -1,0 +1,36 @@
+.venv/
+venv/
+__pycache__/
+.pytest_cache/
+.idea/
+.vscode/
+.DS_Store
+
+# Local config / secrets
+.env
+.magnus_pulse
+
+# Logs & data
+*.log
+*.db
+*.sqlite3
+log.txt
+magnus_live.log
+magnus_structured.log
+data/
+
+# Node / TS
+node_modules/
+dist/
+
+# Cursor / editor artefacts
+.cursor/
+.cursorrules
+
+# Archives
+docs_build/
+site_build/
+docs.zip
+archive.zip
+archive_*
+
