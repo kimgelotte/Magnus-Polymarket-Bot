@@ -9,11 +9,43 @@ class MagnusWarRoom:
     SHARED_GOAL = (
         "We grow capital by buying low and selling high before resolution. "
         "We only enter when there is a realistic path to selling at a higher price than we paid (net profit); otherwise we do not trade. "
+        "We pursue EDGE in ALL categories – Sports, Crypto, Politics, Weather, Business, Tech, Earnings, Geopolitics, etc. "
+        "The CATALYST is whatever can move the price in that category: news, data, forecast, event, report, or sentiment. "
         "We focus on VOLATILE markets (price has moved up and down). "
         "We use PRICE PATTERNS – where price sits in its historical range (high/low/avg) – to TIME entry: "
         "buy when price is relatively LOW in the range, sell when it has moved UP toward our target."
     )
     LAWYER_RULES_MAX_LEN = 500  # Trunkera rules för att spara tokens; titel + inledande text räcker för PASS/FAIL
+
+    # Kort hint per kategori: vad som räknas som katalysator – används i Scout för tydlig analysgrund
+    CATALYST_HINTS = {
+        "Sports": "Catalyst = injury/lineup news, result, form; use LIVE RESEARCH for recent reports.",
+        "Crypto": "Catalyst = price move, meme/sentiment, ETF/regulation news; use LIVE RESEARCH for momentum.",
+        "Politics": "Catalyst = official statement, vote, ruling; use LIVE RESEARCH for breaking news.",
+        "Geopolitics": "Catalyst = statement from leaders, military/UN; use LIVE RESEARCH for developments.",
+        "Pop Culture": "Catalyst = nomination, release, award; use LIVE RESEARCH for announcements.",
+        "Culture": "Same as Pop Culture: official/fan news; use LIVE RESEARCH.",
+        "Business": "Catalyst = M&A, CEO, earnings, regulator; use LIVE RESEARCH for company news.",
+        "Economics": "Catalyst = Fed/ECB decision, jobs/inflation data; use LIVE RESEARCH for timing.",
+        "Tech": "Catalyst = product/earnings/regulator; use LIVE RESEARCH for milestones.",
+        "Weather": "Catalyst = forecast (e.g. Open-Meteo in LIVE RESEARCH); use it to judge outcome likelihood.",
+        "Trump": "Catalyst = court ruling, election result, official statement; use LIVE RESEARCH.",
+        "Elections": "Catalyst = result, exit poll, authority; use LIVE RESEARCH for updates.",
+        "World": "Catalyst = official/UN event; use LIVE RESEARCH.",
+        "Earnings": "Catalyst = report date, guidance, consensus; use LIVE RESEARCH for dates.",
+        "Mentions": "Catalyst = speech/mention schedule; use LIVE RESEARCH for transcripts.",
+        "Unknown": "Catalyst = whatever can move price for this market; use LIVE RESEARCH to find it.",
+    }
+
+    # Extra sökord per kategori för Tavily/NewsAPI – ger mer relevant research
+    CATEGORY_SEARCH_HINTS = {
+        "Sports": "news injury lineup result",
+        "Crypto": "price sentiment",
+        "Earnings": "earnings report date",
+        "Economics": "Fed data release",
+        "Geopolitics": "news development",
+        "Weather": "forecast",  # Open-Meteo används separat; Tavily som komplement
+    }
 
     def __init__(self):
         load_dotenv()
@@ -92,15 +124,119 @@ class MagnusWarRoom:
         except Exception:
             return ""
 
-    async def _fetch_research_snippet(self, question: str, category: str) -> str:
-        """Runs Tavily and NewsAPI in parallel, combines into snippet for Scout. Empty if no keys or error."""
+    def _is_weather_market(self, question: str, category: str) -> bool:
+        """True if this market is about weather/temperature (so we can fetch forecast as catalyst)."""
+        if category == "Weather":
+            return True
+        q = (question or "").lower()
+        return any(
+            kw in q for kw in ("temperature", "temp ", "weather", "°c", "°f", "degrees", "highest temp", "lowest temp")
+        )
+
+    def _parse_weather_location_and_date(self, question: str, end_date: str | None) -> tuple[str | None, str | None]:
+        """Extract location and date for weather forecast. Returns (location, yyyy-mm-dd) or (None, None)."""
+        q = (question or "").strip()
+        location = None
+        if " in " in q:
+            part = q.split(" in ", 1)[1]
+            location = part.split(" on ")[0].split("?")[0].strip()
+            if not location or len(location) > 50:
+                location = None
+        if not location:
+            return None, None
+        # Prefer end_date (e.g. 2025-03-06); else try "March 6" in question
+        target = None
+        if end_date and re.match(r"\d{4}-\d{2}-\d{2}", end_date):
+            target = end_date[:10]
+        if not target:
+            months = {"january": "01", "february": "02", "march": "03", "april": "04", "may": "05", "june": "06",
+                      "july": "07", "august": "08", "september": "09", "october": "10", "november": "11", "december": "12"}
+            ql = q.lower()
+            for name, num in months.items():
+                if name in ql:
+                    m = re.search(rf"{name}\s+(\d{{1,2}})", ql)
+                    if m:
+                        day = m.group(1).zfill(2)
+                        y = datetime.now(timezone.utc).year
+                        target = f"{y}-{num}-{day}"
+                    break
+        return location, target
+
+    async def _fetch_weather_forecast(self, question: str, end_date: str | None) -> str:
+        """Fetches weather forecast from Open-Meteo (free, no key) for location/date. Empty on error."""
+        location, target_date = self._parse_weather_location_and_date(question, end_date)
+        if not location or not target_date:
+            return ""
+        try:
+            async with httpx.AsyncClient() as client:
+                geo = await client.get(
+                    "https://geocoding-api.open-meteo.com/v1/search",
+                    params={"name": location, "count": 1},
+                    timeout=5.0,
+                )
+                if geo.status_code != 200 or not (geo_json := geo.json()):
+                    return ""
+                results = geo_json.get("results") or []
+                if not results:
+                    return ""
+                lat = results[0].get("latitude")
+                lon = results[0].get("longitude")
+                if lat is None or lon is None:
+                    return ""
+                fc = await client.get(
+                    "https://api.open-meteo.com/v1/forecast",
+                    params={
+                        "latitude": lat, "longitude": lon,
+                        "daily": "temperature_2m_max,temperature_2m_min",
+                        "timezone": "auto",
+                    },
+                    timeout=5.0,
+                )
+                if fc.status_code != 200 or not (fc_json := fc.json()):
+                    return ""
+                daily = fc_json.get("daily") or {}
+                times = daily.get("time") or []
+                try:
+                    idx = times.index(target_date)
+                except ValueError:
+                    idx = 0 if times else -1
+                if idx < 0:
+                    return ""
+                max_t = daily.get("temperature_2m_max")
+                min_t = daily.get("temperature_2m_min")
+                max_val = max_t[idx] if isinstance(max_t, list) and len(max_t) > idx else None
+                min_val = min_t[idx] if isinstance(min_t, list) and len(min_t) > idx else None
+                if max_val is None and min_val is None:
+                    return ""
+                parts = [f"Weather forecast for {location} on {target_date} (Open-Meteo):"]
+                if max_val is not None:
+                    parts.append(f" max {float(max_val):.0f}°C")
+                if min_val is not None:
+                    parts.append(f" min {float(min_val):.0f}°C")
+                return "".join(parts).strip()
+        except Exception:
+            return ""
+
+    async def _fetch_research_snippet(self, question: str, category: str, end_date: str | None = None) -> str:
+        """Runs Tavily, NewsAPI and (for weather markets) Open-Meteo forecast; combines into snippet for Scout."""
         query = (question or "").strip()[:300]
         if not query:
             return ""
-        tavily_task = self._fetch_tavily(query, max_results=4)
-        news_task = self._fetch_newsapi(query, max_results=4)
-        tavily_text, news_text = await asyncio.gather(tavily_task, news_task)
+        # Kategori-medveten query: lägg till sökord som ger mer relevant research
+        hint = self.CATEGORY_SEARCH_HINTS.get(category, "")
+        search_query = f"{query} {hint}".strip() if hint else query
+        tavily_task = self._fetch_tavily(search_query, max_results=4)
+        news_task = self._fetch_newsapi(search_query, max_results=4)
+        if self._is_weather_market(question, category):
+            tavily_text, news_text, weather_text = await asyncio.gather(
+                tavily_task, news_task, self._fetch_weather_forecast(question, end_date)
+            )
+        else:
+            tavily_text, news_text = await asyncio.gather(tavily_task, news_task)
+            weather_text = ""
         parts = []
+        if weather_text:
+            parts.append("Weather (Open-Meteo forecast – use as catalyst for price move):\n" + weather_text)
         if tavily_text:
             parts.append("Web/News (Tavily):\n" + tavily_text)
         if news_text:
@@ -119,10 +255,10 @@ class MagnusWarRoom:
                     "role": "system",
                     "content": (
                         f"You are a time gatekeeper. Today: {today}. We buy low and sell high BEFORE resolution; we do not hold to expiry.\n"
-                        "Rule: PASS so the market can reach the next stage (Scout + Quant). Only FAIL if there is clearly NO time left to trade (e.g. resolution in under 12 hours).\n"
-                        "Sports / Elections / Politics: almost always PASS – these have clear catalysts and we exit before resolution. FAIL only if end date is in the past or in under ~12 hours.\n"
-                        "Crypto / Geopolitics / Other: PASS if end date is at least ~1 day away. When borderline: PASS (Quant decides).\n"
-                        "Do NOT FAIL just because resolution is far in the future – we sell before then. Do NOT FAIL for 'uncertainty'. Only FAIL when time-to-resolution is clearly too short to trade.\n"
+                        "We trade ALL categories (Sports, Crypto, Politics, Weather, Business, Tech, Earnings, Geopolitics, etc.) when there is edge.\n"
+                        "Rule: PASS so the market can reach Scout + Quant. Only FAIL if there is clearly NO time left (resolution in the past or in under ~12 hours).\n"
+                        "For ANY category: PASS if end date is at least ~12 hours away. When borderline: PASS (Quant decides).\n"
+                        "Do NOT FAIL for 'uncertainty' or because resolution is far in the future. Only FAIL when time-to-resolution is clearly too short to trade.\n"
                         "Reply ONLY with exactly: PASS or FAIL"
                     )
                 },
@@ -133,8 +269,15 @@ class MagnusWarRoom:
         try:
             async with httpx.AsyncClient() as client:
                 resp = await client.post(url, headers=headers, json=payload, timeout=12.0)
-                if resp.status_code != 200: return False
-                return "PASS" in resp.json()['choices'][0]['message']['content'].strip().upper()
+                if resp.status_code != 200:
+                    body = resp.text
+                    if resp.status_code == 429 or "rate limit" in (body or "").lower() or "insufficient" in (body or "").lower():
+                        print("   ⚠️ Bouncer API: rate limit eller slut på krediter (Grok). PASS för att inte blocka.")
+                    return False
+                return "PASS" in (resp.json() or {}).get("choices", [{}])[0].get("message", {}).get("content", "").strip().upper()
+        except httpx.TimeoutException:
+            print("   ⚠️ Bouncer API: timeout.")
+            return False
         except Exception:
             return False
 
@@ -162,8 +305,13 @@ class MagnusWarRoom:
         try:
             async with httpx.AsyncClient() as client:
                 resp = await client.post(url, headers=headers, json=payload, timeout=20.0)
+                if resp.status_code != 200:
+                    body = (resp.text or "").lower()
+                    if resp.status_code == 429 or "rate limit" in body or "overloaded" in body or "insufficient" in body:
+                        print("   ⚠️ Lawyer API: rate limit eller slut på krediter (Claude). FAIL för denna kandidat.")
+                    return {"passed": False, "criteria_summary": ""}
                 data = resp.json()
-                text = data["content"][0]["text"].strip()
+                text = (data.get("content") or [{}])[0].get("text", "").strip()
                 passed = "PASS" in text.upper()
                 criteria_summary = ""
                 if passed:
@@ -173,6 +321,9 @@ class MagnusWarRoom:
                         if idx >= 0:
                             criteria_summary = text[idx + len(key):].strip().split("\n")[0][:400]
                 return {"passed": passed, "criteria_summary": criteria_summary}
+        except httpx.TimeoutException:
+            print("   ⚠️ Lawyer API: timeout.")
+            return {"passed": False, "criteria_summary": ""}
         except Exception:
             return {"passed": False, "criteria_summary": ""}
 
@@ -232,9 +383,11 @@ class MagnusWarRoom:
             "Reply format: SCORE: [1-10] | INFO: [Your findings]"
         ),
         "Weather": (
-            "You are a specialist scout for WEATHER. Sources: official weather services (NOAA, etc.), satellite/models. "
-            "X: meteorologists, local reports. History: similar periods, season. "
-            "SCORE 1–10: How likely is it that this market can make us money (weather development that drives the price)? "
+            "You are a specialist scout for WEATHER. PRIMARY SOURCE: use the LIVE RESEARCH above – if it includes "
+            "Open-Meteo (or other) forecast with max/min temperature for the relevant date and location, that IS the "
+            "catalyst. Compare forecast to the market question (e.g. 'Will temp reach X°C?'): if forecast is near or "
+            "above threshold, price can move up as others react. Also: official weather services, X. "
+            "SCORE 1–10: How likely is it that this market can make us money (forecast/weather development that drives the price)? "
             "Reply format: SCORE: [1-10] | INFO: [Your findings]"
         ),
         "Trump": (
@@ -278,16 +431,18 @@ class MagnusWarRoom:
             "SCORE 1–10: How likely is it that this market can make us money (catalyst that drives the price up)? "
             "Reply format: SCORE: [1-10] | INFO: [Your findings]"
         )
+        catalyst_hint = self.CATALYST_HINTS.get(category, self.CATALYST_HINTS["Unknown"])
         user_content = ""
         if research_snippet and research_snippet.strip():
             user_content = (
-                "LIVE RESEARCH (recent web and news – use this if relevant):\n"
+                "LIVE RESEARCH (recent web, news, or forecast – primary basis for your assessment):\n"
                 f"{research_snippet.strip()[:2000]}\n\n"
             )
         user_content += (
+            f"ANALYSIS FOUNDATION for this category: {catalyst_hint}\n\n"
             f"Analyse the current situation for: {question}. "
             "Is there anything that can drive the price UP so we can buy now and sell at a higher price later (net profit)? "
-            "We do not need to believe the outcome will be true – only that the price has potential to move up. Use news, X and history (and the LIVE RESEARCH above if provided)."
+            "We do not need to believe the outcome will be true – only that the price has potential to move up. Use the LIVE RESEARCH above and the analysis foundation."
         )
         payload = {
             "model": self.model_scout,
@@ -307,6 +462,9 @@ class MagnusWarRoom:
             async with httpx.AsyncClient() as client:
                 resp = await client.post(url, headers=headers, json=payload, timeout=20.0)
                 if resp.status_code != 200:
+                    body = (resp.text or "").lower()
+                    if resp.status_code == 429 or "rate limit" in body or "insufficient" in body:
+                        print("   ⚠️ Scout API: rate limit eller slut på krediter (Grok). Använder score 5.")
                     return default_out
                 text = resp.json().get("choices", [{}])[0].get("message", {}).get("content", "").strip()
                 score, summary = 5, ""
@@ -322,6 +480,9 @@ class MagnusWarRoom:
                 if not summary:
                     summary = text[:500] if text else default_out["summary"]
                 return {"score": score, "summary": summary}
+        except httpx.TimeoutException:
+            print("   ⚠️ Scout API: timeout.")
+            return default_out
         except Exception:
             return default_out
 
@@ -340,7 +501,10 @@ class MagnusWarRoom:
             lines.append("Price is NEAR historical lows – possible 'bottom' situation if a catalyst exists.")
         if pc.get("change_1h") is not None:
             lines.append(f"Change in the last hour: {pc.get('change_1h')}%.")
-        lines.append("Use this to judge if we are at a relative low in the range (good entry) or near the top (avoid).")
+        if (pc.get("range_pct") or 0) == 0 and pc.get("high") == pc.get("low"):
+            lines.append("No historical range data – base entry on price vs value and catalyst only.")
+        else:
+            lines.append("Use this to judge if we are at a relative low in the range (good entry) or near the top (avoid).")
         return " ".join(lines)
 
     # Quant: category-specific logic – can price move up? tradability
@@ -354,13 +518,13 @@ class MagnusWarRoom:
         "Business": "Can reports/M&A/CEO news drive the price up? Require concrete news that is not already priced in.",
         "Economics": "Can Fed/data drive the price? Prefer clear timing and source; REJECT only on clearly vague macro questions.",
         "Tech": "Can milestone/earnings drive the price up? Prefer date; avoid long-term speculation.",
-        "Weather": "Can weather development drive the price? Prefer official sources and date; REJECT only on clearly vague seasonal questions.",
+        "Weather": "Weather FORECAST (e.g. Open-Meteo in research/Scout) IS the catalyst: use forecast max/min to judge if outcome is likely. If forecast supports the outcome (e.g. forecast temp near or above threshold), BUY when price is below that probability; only REJECT if forecast clearly contradicts or no forecast data.",
         "Trump": "Can factual events (rulings, elections) drive the price up? REJECT only on pure speculation with no catalyst.",
         "Elections": "Can election development/exit polls drive the price? Require clear resolution and source.",
         "World": "Can a concrete event (official sources, UN) drive the price up?",
         "Earnings": "Can report/guidance drive the price? Prefer date and company; REJECT only if clearly unclear.",
         "Mentions": "Can Fed/speech/video drive the price? Prefer schedules and frequency; REJECT only on clearly vague mentions.",
-        "Unknown": "Require clear edge and price below value. Assess whether the price can move up (tradability).",
+        "Unknown": "Same as other categories: identify what can move the price (news, data, event). Use Scout output and LIVE RESEARCH as catalyst. BUY when price below value and plausible path up; REJECT only when clearly no catalyst or no time.",
     }
 
     async def _deepseek_quant(self, question: str, price: float, hype_data: dict, stats: dict, category: str, similar_analyses: str = "", days_until_end: float | None = None, price_context: dict | None = None, criteria_summary: str = "", spread_pct: float | None = None, bid: float | None = None, ask: float | None = None, uncertain_market: bool = False, event_markets_context: str = "") -> dict:
@@ -372,17 +536,18 @@ class MagnusWarRoom:
 
         prompt = (
             f"Our goal: {self.SHARED_GOAL} "
-            "Your role: decision-maker for buy/sell timing. You are the only one who outputs BUY or REJECT; you must use PRICE CONTEXT for timing.\n\n"
+            "Your role: decision-maker for buy/sell timing. We trade ALL categories; the catalyst is what can move the price in that category (see LOGIC TO FOLLOW). "
+            "You are the only one who outputs BUY or REJECT; you must use PRICE CONTEXT for timing.\n\n"
             "CORE PRINCIPLE: We want to buy CHEAP and sell DEAR. That means: buy CHEAPER THAN IT IS WORTH (current price lower than our assessed value), and sell at a higher price = profit. "
             "We sell before resolution; we do not need to believe the outcome will be true – only that the price can go up. "
-            "BUY when the current price is meaningfully below what you judge the outcome to be worth (your MAX_PRICE) and there is a realistic path for price to move up. When in doubt: set MAX_PRICE LOWER rather than REJECT; only REJECT when there is clearly no edge or no time.\n\n"
+            "BUY when the current price is meaningfully below what you judge the outcome to be worth (your MAX_PRICE) and there is a realistic path for price to move up. When in doubt: set MAX_PRICE LOWER rather than REJECT; only REJECT when there is clearly no edge or no time. We prefer to BUY when there is any plausible edge – REJECT only when there is clearly no way to sell at a profit (e.g. no catalyst, no time, or price already at ceiling).\n\n"
             "NON-NEGOTIABLE: We must sell at a profit (price strictly above our entry). Only BUY if there is a realistic path to selling at a price above entry before resolution. "
             "MAX_PRICE must be a SELLABLE level we can plausibly reach (what buyers might pay), not a theoretical fair value we may never see. "
             "If the only way to 'win' would be to hold to resolution, REJECT – we exit before resolution and must realise profit in the secondary market.\n\n"
             "STRATEGY: We only look at volatile markets (this one has sufficient historical range). Use STATS and PRICE CONTEXT (high, low, avg, where price sits in the range) to spot PATTERNS: BUY when price is relatively LOW in the range so we can sell when it has moved up; REJECT if price is already HIGH in the range with little upside left.\n\n"
             f"CATEGORY: {category}\n"
             f"LOGIC TO FOLLOW: {specific_logic}\n"
-            "Use historical range and where the current price sits (vs low/avg/high): prefer BUY when price is in the lower part of the range with clear upside; REJECT when price is already high in the range.\n\n"
+            "Use historical range and where the current price sits (vs low/avg/high): prefer BUY when price is in the lower part of the range or when there is a plausible catalyst; only REJECT when price is clearly at the top of the range with no upside and no catalyst.\n\n"
         )
         if uncertain_market:
             prompt += "Uncertain market: require clear edge and low spread. For Geopolitics, Crypto and Earnings: require especially clear edge in an uncertain market.\n"
@@ -391,6 +556,8 @@ class MagnusWarRoom:
             f"PRICE NOW: {price} (decimal 0–1, e.g. 0.55 = 55¢)\n"
             f"STATS (high/low/avg/change_1h): {stats}\n"
         )
+        if stats.get("high") == stats.get("low") and stats.get("high") is not None:
+            prompt += "Note: No historical range (high=low). Do NOT REJECT solely for 'at historical high' – judge by price vs your MAX_PRICE and catalyst only.\n"
         if criteria_summary and criteria_summary.strip():
             prompt += f"LAWYER'S CRITERIA ANALYSIS: Use to assess whether there are clear catalysts that can move the price, and whether the market is tradable. Set MAX_PRICE based on how high the price can move (buyers/sentiment), not only probability that Yes wins. {criteria_summary.strip()}\n"
         if days_until_end is not None:
@@ -414,7 +581,7 @@ class MagnusWarRoom:
             f"RULES: BUY only if (1) current price is CHEAPER THAN IT IS WORTH (current price < your MAX_PRICE with margin), AND (2) realistic path to selling at a profit (price moves up), AND (3) enough time left, AND (4) the rules are clear enough for the market to be tradable and to resolve (avoid vague/manipulated markets), AND (5) spread is acceptable (if spread > {spread_cap}% a clear edge is required; otherwise REJECT), AND (6) MAX_PRICE is a sellable level we can plausibly reach – not a hope value. "
             "REJECT if the price is not cheap, no realistic path to net profit, too little time, the market is untradable or manipulated, or spread too high without clear edge.\n"
             "MAX_PRICE must be a decimal between 0.01 and 0.99 (not percent).\n"
-            "Reply exactly:\nACTION: [BUY or REJECT]\nMAX_PRICE: [number 0.01–0.99]\nREASON: [Short justification]"
+            "Reply exactly:\nACTION: [BUY or REJECT]\nMAX_PRICE: [number 0.01–0.99]\nREASON: [One short sentence only]"
         )
         
         timeout_sec = 90.0
@@ -494,10 +661,13 @@ class MagnusWarRoom:
         if self.skip_lawyer:
             print(f"   ⚖️ Lawyer: skipped (MAGNUS_SKIP_LAWYER)")
 
-        # Live research (Tavily + NewsAPI) as input for Scout
-        research_snippet = await self._fetch_research_snippet(q, category)
+        # Live research (Tavily + NewsAPI + för vädermarknader: Open-Meteo-prognos) som indata till Scout
+        research_snippet = await self._fetch_research_snippet(q, category, market_data.get("end_date"))
         if research_snippet:
-            print(f"   📡 Live research (Tavily/NewsAPI) included in Scout.")
+            if self._is_weather_market(q, category) and "Open-Meteo" in research_snippet:
+                print(f"   📡 Live research inkl. väderprognos (Open-Meteo) till Scout.")
+            else:
+                print(f"   📡 Live research (Tavily/NewsAPI) included in Scout.")
 
         # Scout (category-specific hype score)
         hype = await self._grok_radar(q, category, research_snippet=research_snippet)

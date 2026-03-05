@@ -7,6 +7,7 @@ import asyncio
 import threading
 import datetime as dt
 from typing import Dict, Tuple, Any
+import os
 
 # Root path for imports when running from different directories
 import sys
@@ -44,6 +45,8 @@ class MarketScanner(threading.Thread):
         self.sleep_between_rounds = sleep_between_rounds_seconds
         self._dedup: Dict[Tuple[str, str], float] = {}
         self._stop = threading.Event()
+        # Verbos logg (en 🔍‑rad per event) kan slås på med MAGNUS_VERBOSE_SCANNER=1.
+        self.verbose = os.getenv("MAGNUS_VERBOSE_SCANNER", "0").strip().lower() in ("1", "true", "yes")
 
     def stop(self):
         self._stop.set()
@@ -66,7 +69,7 @@ class MarketScanner(threading.Thread):
         self._dedup[(str(m_id), str(token_id))] = time.time()
 
     def _build_event_markets_overview(self, markets: list, event_title: str) -> list:
-        """Get price (and spread) for all markets in event so War Room can compare and find best entry."""
+        """Get price (and spread) for all markets in event. Använder Gamma outcomePrices (0–1, som webben) när tillgängligt, annars CLOB."""
         overview = []
         for market_data in markets:
             m_id = str(market_data.get("id"))
@@ -75,6 +78,12 @@ class MarketScanner(threading.Thread):
                 continue
             t_ids = json.loads(t_ids_raw) if isinstance(t_ids_raw, str) else t_ids_raw
             group_title = market_data.get("groupItemTitle") or "Yes"
+            outcome_prices = market_data.get("outcomePrices")
+            if isinstance(outcome_prices, str):
+                try:
+                    outcome_prices = json.loads(outcome_prices)
+                except Exception:
+                    outcome_prices = None
             for token_idx, token_id in enumerate(t_ids):
                 outcome_label = (
                     "Yes"
@@ -82,10 +91,22 @@ class MarketScanner(threading.Thread):
                     else ("No" if token_idx == 1 and len(t_ids) == 2 else f"Outcome{token_idx}")
                 )
                 try:
-                    price = self.trade.polymarket.get_buy_price(token_id)
+                    price = None
+                    if outcome_prices and token_idx < len(outcome_prices):
+                        try:
+                            p = outcome_prices[token_idx]
+                            price = float(p) if p is not None else None
+                        except (TypeError, ValueError):
+                            pass
+                    if price is None or price == 0:
+                        price = self.trade.polymarket.get_buy_price(token_id)
+                    if price and price > 1.0:
+                        price = price / 100.0
                     bid, ask, _liq = self.trade.polymarket.get_book(token_id)
-                    if price == 0 and bid is not None and ask is not None:
+                    if (price is None or price == 0) and bid is not None and ask is not None:
                         price = (float(bid) + float(ask)) / 2
+                        if price and price > 1.0:
+                            price = price / 100.0
                     spread_pct = None
                     if bid and ask and (float(bid) + float(ask)) > 0:
                         mid = (float(bid) + float(ask)) / 2
@@ -97,6 +118,9 @@ class MarketScanner(threading.Thread):
                         "token_id": str(token_id),
                         "price": round(float(price), 3) if price else 0,
                         "spread_pct": spread_pct,
+                        "bid": float(bid) if bid is not None else None,
+                        "ask": float(ask) if ask is not None else None,
+                        "bid_liquidity": float(_liq) if _liq is not None else 0.0,
                     })
                 except Exception:
                     continue
@@ -152,7 +176,7 @@ class MarketScanner(threading.Thread):
             events.sort(key=lambda e: 0 if e.get("category", "") in preferred else 1)
 
             n_events = len(events)
-            print(f"\n   [Scanner] Processing {n_events} events ({strategy})…")
+            print(f"\n📡 SCANNER ({strategy}): {n_events} events – bearbetar…", flush=True)
             enqueued_this_round = 0
             to_bouncer = 0
             bouncer_pass_count = 0
@@ -161,11 +185,14 @@ class MarketScanner(threading.Thread):
             skip_liquidity = 0
             skip_days = 0
             skip_range = 0
+            skip_spread = 0
+            skip_dup = 0
+            skip_queue_full = 0
             for count, event in enumerate(events, 1):
                 if self._stop.is_set():
                     return
-                if count % 100 == 0 or count == n_events:
-                    print(f"\n   [Scanner] {count}/{n_events} events…")
+                if count == n_events or (n_events <= 50 and count % 5 == 0) or (n_events > 50 and count % 20 == 0):
+                    print(f"   [Scanner] {count}/{n_events} events…", flush=True)
                 try:
                     e_title = event.get("title", "Untitled")
                     e_category = event.get("category") or "Unknown"
@@ -197,12 +224,15 @@ class MarketScanner(threading.Thread):
                         except Exception:
                             pass
 
-                    cat_tag = f"[{e_category}]" if e_category and e_category != "Unknown" else ""
-                    print(f"   🔍 {cat_tag} {e_title[:70]}")
+                    # Håll loggen ren: standard = ingen per‑event‑rad. Sätt MAGNUS_VERBOSE_SCANNER=1 för att visa.
+                    if self.verbose:
+                        cat_tag = f"[{e_category}]" if e_category and e_category != "Unknown" else ""
+                        print(f"   🔍 {cat_tag} {e_title[:70]}")
 
                     # Research: all markets in event (prices) to find best profit potential
                     event_markets_overview = self._build_event_markets_overview(markets, e_title)
                     event_markets_summary_str = self._format_event_markets_for_prompt(event_markets_overview, e_title)
+                    overview_by_token = {str(r["token_id"]): r for r in event_markets_overview}
                     event_id = str(event.get("id") or "")
 
                     for market_data in markets:
@@ -222,22 +252,57 @@ class MarketScanner(threading.Thread):
                             if self._stop.is_set():
                                 return
                             try:
-                                current_price = self.trade.polymarket.get_buy_price(token_id)
-                                bid, ask, bid_liquidity = self.trade.polymarket.get_book(token_id)
-                                if current_price == 0 and bid is not None and ask is not None:
-                                    current_price = (bid + ask) / 2
-                                if current_price < 0.10 or current_price > self.trade.max_entry_price:
+                                tid_str = str(token_id)
+                                if tid_str in overview_by_token:
+                                    row = overview_by_token[tid_str]
+                                    current_price = float(row.get("price") or 0)
+                                    bid = row.get("bid")
+                                    ask = row.get("ask")
+                                    bid_liquidity = float(row.get("bid_liquidity") or 0)
+                                    if current_price == 0 and bid is not None and ask is not None:
+                                        current_price = (float(bid) + float(ask)) / 2
+                                    spread_pct = row.get("spread_pct")
+                                else:
+                                    current_price = None
+                                    op = market_data.get("outcomePrices")
+                                    if isinstance(op, str):
+                                        try:
+                                            op = json.loads(op)
+                                        except Exception:
+                                            op = None
+                                    if op and token_idx < len(op):
+                                        try:
+                                            current_price = float(op[token_idx])
+                                        except (TypeError, ValueError):
+                                            pass
+                                    if current_price is None:
+                                        current_price = self.trade.polymarket.get_buy_price(token_id)
+                                    if current_price > 1.0:
+                                        current_price = current_price / 100.0
+                                    bid, ask, bid_liquidity = self.trade.polymarket.get_book(token_id)
+                                    if current_price == 0 and bid is not None and ask is not None:
+                                        mid_p = (bid + ask) / 2
+                                        current_price = mid_p / 100.0 if mid_p > 1.0 else mid_p
+                                    spread_pct = None
+                                    if bid and ask and (bid + ask) > 0:
+                                        mid = (bid + ask) / 2
+                                        spread_pct = round((ask - bid) / mid * 100, 1)
+                                min_p = getattr(self.trade, "min_entry_price", 0.001)
+                                max_p = getattr(self.trade, "max_entry_price", 0.999)
+                                if current_price < min_p or current_price > max_p:
                                     skip_price += 1
+                                    if self.verbose and skip_price <= 3:
+                                        print(f"      [price skip] raw={current_price} (min={min_p}, max={max_p})", flush=True)
                                     continue
                                 # Liquidity filter: thin orderbook → hard to sell without slippage
                                 if bid_liquidity < self.trade.min_bid_liquidity_usdc:
                                     skip_liquidity += 1
                                     continue
-
-                                spread_pct = None
-                                if bid and ask and (bid + ask) > 0:
-                                    mid = (bid + ask) / 2
-                                    spread_pct = round((ask - bid) / mid * 100, 1)
+                                # Spread: Quant REJECT:ar nästan alltid vid >15–25%; filtrera tidigt så vi sparar War Room-anrop
+                                max_spread = getattr(self.trade, "max_spread_pct", 95.0)
+                                if spread_pct is not None and spread_pct > max_spread:
+                                    skip_spread += 1
+                                    continue
 
                                 history = self.trade.polymarket.get_price_history(token_id)
                                 stats = self.trade.war_room._process_history(history)
@@ -252,9 +317,7 @@ class MarketScanner(threading.Thread):
                                     for kw in ["price of", "above $", "below $", "finish week", "finish the week"]
                                 ) or "$" in e_title
                                 min_days = 0.8
-                                if e_category in self.trade.preferred_categories:
-                                    min_days = 0.4
-                                elif is_price_event and e_category in self.trade.high_risk_categories:
+                                if is_price_event and e_category in self.trade.high_risk_categories:
                                     min_days = 1.2
                                 elif e_category in self.trade.high_risk_categories:
                                     min_days = 1.0
@@ -325,7 +388,7 @@ class MarketScanner(threading.Thread):
                                             )
                                         )
                                     except Exception as bouncer_err:
-                                        print(f"\n⚠️ [Scanner] Bouncer error for {full_title[:40]}…: {bouncer_err}")
+                                        print(f"\n⚠️ [Scanner] Bouncer error for {full_title[:40]}…: {(str(bouncer_err)[:80])}")
                                         bouncer_ok = False
                                     if not bouncer_ok:
                                         print(f"      ⛔ Bouncer FAIL: {full_title[:60]}")
@@ -333,14 +396,15 @@ class MarketScanner(threading.Thread):
                                     bouncer_pass_count += 1
 
                                 if self._is_duplicate(m_id, token_id):
+                                    skip_dup += 1
                                     continue
                                 try:
                                     self.candidate_queue.put_nowait(candidate)
                                     self._mark_enqueued(m_id, token_id)
                                     enqueued_this_round += 1
-                                    print(f"      ✅ Bouncer PASS → queue: {full_title[:60]} @ {current_price:.2f}")
+                                    print(f"      → Kö: {full_title[:58]} @ {current_price:.2f}", flush=True)
                                 except queue.Full:
-                                    pass  # Queue full – skip, prioritize fresh candidates (bounded 500)
+                                    skip_queue_full += 1
 
                             except Exception as tok_err:
                                 # Single token errors should not stop the whole round
@@ -349,20 +413,32 @@ class MarketScanner(threading.Thread):
                 except Exception as ev_err:
                     continue
 
-            # Diagnostik: var stoppar det?
+            # Formaterad sammanfattning – alltid synlig efter varje runda (flush så det inte fastnar i buffer)
             parts = []
             if skip_scan: parts.append(f"scan={skip_scan}")
             if skip_price: parts.append(f"price={skip_price}")
             if skip_liquidity: parts.append(f"liq={skip_liquidity}")
             if skip_days: parts.append(f"days={skip_days}")
             if skip_range: parts.append(f"range={skip_range}")
-            pre_str = " | skip: " + ", ".join(parts) if parts else ""
-            if to_bouncer == 0:
-                print(f"\n📋 [Scanner] {strategy}: 0 → Bouncer.{pre_str}")
-            elif enqueued_this_round > 0:
-                print(f"\n📥 [Scanner] {strategy}: {to_bouncer} → Bouncer, {bouncer_pass_count} PASS, {enqueued_this_round} i kön.{pre_str}")
+            if skip_spread: parts.append(f"spread={skip_spread}")
+            if skip_dup: parts.append(f"dup={skip_dup}")
+            if skip_queue_full: parts.append(f"full={skip_queue_full}")
+            _f = lambda s: print(s, flush=True)
+            _f("\n" + "─" * 60)
+            _f("📡 SCANNER – resultat (" + strategy + ")")
+            _f("   Hittade: " + str(n_events) + " events, " + str(to_bouncer) + " token(s) passerade pre-filter.")
+            if enqueued_this_round > 0:
+                _f("   → Till analys (kön): " + str(enqueued_this_round) + " kandidat(er).")
             else:
-                print(f"\n📋 [Scanner] {strategy}: {to_bouncer} → Bouncer, {bouncer_pass_count} PASS, 0 i kön (dup/full).{pre_str}")
+                why = []
+                if skip_dup: why.append("dup")
+                if skip_queue_full: why.append("kön full")
+                _f("   → Till analys: 0" + (" (" + ", ".join(why) + ")" if why else "") + ".")
+            if parts:
+                _f("   Filtrerade bort: " + ", ".join(parts))
+            if to_bouncer == 0 and skip_price > 0:
+                _f("   Tip: många skippade på pris – kör med MAGNUS_VERBOSE_SCANNER=1 för att se exempel, eller sätt MIN/MAX_ENTRY_PRICE i .env.")
+            _f("─" * 60)
             if self._stop.is_set():
                 return
             # Single pause per round happens in run() via _stop.wait() – avoid double sleep

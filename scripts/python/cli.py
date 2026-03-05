@@ -28,10 +28,14 @@ def main() -> None:
     args = parser.parse_args()
 
     cmd = args.command
-    if cmd == "run-autonomous-trader":
-        run_autonomous_trader()
-    else:
-        raise SystemExit(f"Okänt kommando: {cmd}")
+    try:
+        if cmd == "run-autonomous-trader":
+            run_autonomous_trader()
+        else:
+            raise SystemExit(f"Okänt kommando: {cmd}")
+    except KeyboardInterrupt:
+        # Snyggt avbrott vid Ctrl+C utan full traceback.
+        print("\n👋 Magnus avbruten med Ctrl+C – stänger ner.")
 
 
 if __name__ == "__main__":

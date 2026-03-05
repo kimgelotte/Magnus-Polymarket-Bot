@@ -48,18 +48,44 @@ class Trade:
         self.profit_target = 0.07       # Baseline 7%; raised to 10% for cheap buys
         self.profit_target_high = 0.10  # Used when fill < price_high_threshold
         self.price_high_threshold = 0.30  # If fill < 0.30 use profit_target_high (larger upside)
-        self.min_edge_to_enter = 0.025  # Min 2.5 cent edge – fler köp utan att ta för stor risk
+        try:
+            self.min_edge_to_enter = float(os.getenv("MAGNUS_MIN_EDGE", "0.018"))
+        except ValueError:
+            self.min_edge_to_enter = 0.018  # ~1.8 cent – fler köp; sätt 0.025 för strängare
         self.max_open_positions = 15
         self.max_bet_usdc = 100.0       # Smaller bets for diversification
+        # Polymarket krav: minst $1 per köp, och minst 5 andelar för att kunna sälja (sälj-minimum 5)
+        try:
+            self.min_bet_usdc = float(os.getenv("MAGNUS_MIN_BET_USDC", "1.0"))
+        except ValueError:
+            self.min_bet_usdc = 1.0
+        self.min_shares_to_buy = 5.0   # Polymarket: minst 5 andelar vid sälj – vi måste köpa minst så många
+        try:
+            self.price_move_tolerance = float(os.getenv("MAGNUS_PRICE_MOVE_TOLERANCE", "0.05"))
+        except ValueError:
+            self.price_move_tolerance = 0.05  # Tillåt 5¢ rörelse under analys innan vi skippar
+        # Min andel av saldo per godkänt köp – Kelly kan bli väldigt liten vid låg fair value; då använd minst denna andel
+        try:
+            self.min_bet_pct_balance = float(os.getenv("MAGNUS_MIN_BET_PCT_BALANCE", "0.08"))
+        except ValueError:
+            self.min_bet_pct_balance = 0.08   # 8% av saldo som minst vid godkänt köp (36 USDC → ~2.9 USDC)
         # Tighter stop-loss to improve risk/reward
         self.stop_loss_pct = 0.15
-        self.max_entry_price = 0.80     # Don't buy above 0.80 – något högre för fler kandidater
+        # Bred band så nästan-avgjorda (0.1¢–99.9¢) når analys; Quant avvisar om ingen edge
+        try:
+            self.min_entry_price = float(os.getenv("MAGNUS_MIN_ENTRY_PRICE", "0.001"))
+        except ValueError:
+            self.min_entry_price = 0.001
+        try:
+            self.max_entry_price = float(os.getenv("MAGNUS_MAX_ENTRY_PRICE", "0.999"))
+        except ValueError:
+            self.max_entry_price = 0.999
         # Markets we historically lose on – skip (title match). Bitcoin kan stängas av med MAGNUS_SKIP_BITCOIN=0
         self.skip_title_patterns = [("elon musk", "tweet")]
         if os.getenv("MAGNUS_SKIP_BITCOIN", "1").strip().lower() in ("1", "true", "yes"):
             self.skip_title_patterns.append(("bitcoin", None))
-        # Buy only when price below avg or in lower half of range (MAGNUS_REQUIRE_BELOW_AVG=0 för att stänga av)
-        self.require_below_avg = os.getenv("MAGNUS_REQUIRE_BELOW_AVG", "1").strip().lower() not in ("0", "false", "no")
+        # 0 = köp även om pris inte är under snitt (rekommenderat så Quant-BUY faktiskt blir köp)
+        self.require_below_avg = os.getenv("MAGNUS_REQUIRE_BELOW_AVG", "0").strip().lower() not in ("0", "false", "no")
         self.allow_at_avg_if_hype_min = 6   # If hype_score >= this, allow buy at "near avg" too (0 = off)
         try:
             self.min_range_pct = float(os.getenv("MAGNUS_MIN_RANGE_PCT", "0"))
@@ -71,12 +97,18 @@ class Trade:
         self.balanced_event_categories = ("Sports", "Crypto", "Earnings")
         self.max_positions_per_event = 2
         self.high_risk_categories = ("Crypto", "Business", "Tech", "Economics", "Geopolitics")
-        self.preferred_categories = ("Sports", "Elections", "Politics")
-        # Min bid liquidity for buy allowed (sänkt default så fler marknader når kön)
+        # Alla kategorier i scope – ingen kategoriprioritering; edge avgör.
+        self.preferred_categories = ()
+        # Min bid liquidity for buy allowed (lågt = fler in i analys; Quant kan avvisa illikvida)
         try:
-            self.min_bid_liquidity_usdc = float(os.getenv("MAGNUS_MIN_BID_LIQUIDITY", "10.0"))
+            self.min_bid_liquidity_usdc = float(os.getenv("MAGNUS_MIN_BID_LIQUIDITY", "3.0"))
         except ValueError:
-            self.min_bid_liquidity_usdc = 10.0
+            self.min_bid_liquidity_usdc = 3.0
+        # Max spread % (bid-ask). 95 = ta in nästan allt; Quant avvisar illikvida. Sänk till 50–70 för tightare.
+        try:
+            self.max_spread_pct = float(os.getenv("MAGNUS_MAX_SPREAD_PCT", "95.0"))
+        except ValueError:
+            self.max_spread_pct = 95.0
         # Återhandla marknad efter N dagar (0 = aldrig). Fler kandidater om poolen "torkat".
         try:
             self.allow_retrade_after_days = int(os.getenv("MAGNUS_ALLOW_RETRADE_AFTER_DAYS", "0"))
@@ -235,12 +267,14 @@ class Trade:
                 return
 
             print(f"🧹 Verifying {len(trades)} positions on-chain...")
+            # En anrop för alla positioner istället för N anrop (get_positions per token).
+            positions_map = self.polymarket.get_all_token_balances()
             for i, t in enumerate(trades):
                 t_id = t['token_id']
                 sys.stdout.write(f"\r   [{i+1}/{len(trades)}] Checking: {t['question'][:30]}...")
                 sys.stdout.flush()
 
-                actual_balance = self.polymarket.get_token_balance(t_id)
+                actual_balance = positions_map.get(str(t_id), 0.0)
                 if actual_balance < 0.01:
                     buy_price = float(t.get('buy_price') or 0)
                     target_price = float(t.get('target_price') or 0)
@@ -332,36 +366,17 @@ class Trade:
                     self.db.set_selling_flags(t_id, False, False)
             print()
         except Exception as e:
-            print(f"\n⚠️ Trade management error: {e}")
+            print(f"\n⚠️ Trade management error: {(str(e)[:100])}")
 
     def already_owns(self, market_id: str) -> bool:
         trades = self.db.get_open_positions()
         return any(str(t['market_id']) == str(market_id) for t in trades)
 
     def _allow_market_scan(self, market_id: str) -> bool:
-        """True om marknaden ska få komma in i scannern (ej ägd; ej nyligen handlad om allow_retrade)."""
-        if self.already_owns(market_id):
-            return False
-        if not self.db.has_ever_traded_market(market_id):
-            return True
-        if self.allow_retrade_after_days <= 0:
-            return False
-        last_ts = self.db.get_last_trade_time_for_market(market_id)
-        if not last_ts:
-            return True
-        try:
-            if isinstance(last_ts, str) and "T" in last_ts:
-                last_dt = dt.datetime.fromisoformat(last_ts.replace("Z", "+00:00"))
-            elif isinstance(last_ts, str):
-                last_dt = dt.datetime.strptime(last_ts[:19], "%Y-%m-%d %H:%M:%S")
-            else:
-                return False
-            if last_dt.tzinfo is None:
-                last_dt = last_dt.replace(tzinfo=dt.timezone.utc)
-            age_days = (dt.datetime.now(dt.timezone.utc) - last_dt).days
-            return age_days >= self.allow_retrade_after_days
-        except Exception:
-            return False
+        """True om marknaden ska få komma in i scannern. Blockerar bara om vi har öppen position (already_owns).
+        Tidigare handlade marknader får komma in igen så att analyspoolen inte krymper; allow_retrade_after_days
+        används vid köpbeslut, inte här."""
+        return not self.already_owns(market_id)
 
     def already_has_position_in_event(self, event_id: str) -> bool:
         """True if we already have open position in this event."""
@@ -430,8 +445,8 @@ class Trade:
         scanner = MarketScanner(
             candidate_queue,
             self,
-            strategies=["trending", "featured"],  # fler events = fler kandidater
-            event_limit=1500,
+            strategies=["trending", "featured", "new"],  # trending + new = många events; featured = ~21 från API
+            event_limit=2000,
             dedup_ttl_seconds=dedup_ttl,
             sleep_between_rounds_seconds=scan_interval,
         )
@@ -441,12 +456,11 @@ class Trade:
         while True:
             try:
                 balance = self.polymarket.get_usdc_balance()
-                print(f"\n💵 Balance: {balance:.2f} USDC")
-                self._log_to_live(f"💓 Heartbeat | Balance: {balance:.2f} USDC")
                 self.portfolio_risk.log_balance(balance)
 
                 should_pause, drawdown = self.portfolio_risk.check_drawdown(balance)
                 if should_pause:
+                    print(f"\n💵 Balance: {balance:.2f} USDC")
                     print(f"🛑 Portfolio drawdown {drawdown}% exceeds limit. Pausing new trades for 5 min...")
                     self._log_to_live(f"🛑 Drawdown {drawdown}% — pausing new trades")
                     self.manage_active_trades()
@@ -455,7 +469,8 @@ class Trade:
                 
                 self.manage_active_trades()
                 
-                if balance < 2.0: 
+                if balance < 2.0:
+                    print(f"\n💵 Balance: {balance:.2f} USDC")
                     print(f"💤 Balance < 2.0 USDC. Waiting 2 min...")
                     time.sleep(120); continue
 
@@ -471,11 +486,19 @@ class Trade:
                             tasks = [_loop.create_task(self.war_room.evaluate_market(m, skip_bouncer=skip_bouncer)) for m in payloads]
                             results = _loop.run_until_complete(asyncio.gather(*tasks, return_exceptions=True))
                     except Exception as war_err:
-                        print(f"\n⚠️ War Room error (batch): {war_err}")
-                        traceback.print_exc()
+                        err_short = str(war_err)[:120]
+                        print(f"\n⚠️ War Room error (batch): {err_short}")
+                        self._log_to_live(f"⚠️ War Room batch error: {err_short}")
                         results = [{"action": "REJECT", "reason": f"Error: {war_err}", "max_price": 0.0, "hype_score": 0} for _ in batch_list]
                     for c, raw in zip(batch_list, results):
+                        # Normalisera beslut så vi alltid har konsekvent struktur (ingen tyst default-risk).
                         decision = raw if isinstance(raw, dict) else {"action": "REJECT", "reason": f"Error: {raw}", "max_price": 0.0, "hype_score": 0}
+                        decision["action"] = (decision.get("action") or "REJECT").strip().upper()
+                        if decision["action"] != "BUY":
+                            decision["action"] = "REJECT"
+                        decision["max_price"] = float(decision.get("max_price") or 0)
+                        decision["reason"] = (str(decision.get("reason") or ""))[:500]
+                        decision["hype_score"] = int(decision.get("hype_score") or 0)
                         full_title = c["full_title"]
                         e_category = c["e_category"]
                         current_price = c["current_price"]
@@ -492,8 +515,13 @@ class Trade:
                             max_price=decision.get("max_price", 0), current_price=current_price,
                             hype_score=int(decision.get("hype_score", 0)),
                         )
+                        title_short = (full_title or "")[:48]
                         if decision.get("action") == "REJECT":
+                            reason = (decision.get("reason") or "").strip()[:70]
+                            print(f"   → REJECT: {title_short} | {reason}", flush=True)
                             self._log_to_live(f"❌ REJECT: {decision.get('reason', '')[:80]}")
+                        else:
+                            print(f"   → APPROVED: {title_short} | max {decision.get('max_price', 0):.2f}", flush=True)
                         if decision.get('action') == "BUY":
                             # Balanced events (sport): max 1 buy; others (ETH levels): max N
                             event_id = (c.get("event_id") or "").strip()
@@ -538,8 +566,8 @@ class Trade:
                                 in_lower = price_context.get("in_lower_half")
                                 under_avg = price_context.get("price_vs_avg") == "below average"
                                 hype = int(decision.get("hype_score") or 0)
-                                is_preferred = e_category in self.preferred_categories
-                                hype_threshold = max(self.allow_at_avg_if_hype_min - 2, 1) if is_preferred else self.allow_at_avg_if_hype_min
+                                # Alla kategorier: samma köpvillighet när det finns edge (tidigare "preferred"-logik för alla).
+                                hype_threshold = max(self.allow_at_avg_if_hype_min - 3, 1)
                                 allow_exception = hype_threshold and hype >= hype_threshold
                                 full_title_lower = (full_title or "").lower()
                                 is_price_market = any(
@@ -556,94 +584,94 @@ class Trade:
                                     self._log_to_live(f"⏸️ {msg}")
                                     continue
                             ai_max_price = float(decision.get('max_price', 0.0) or 0.0)
-                            # Hard cap AI max price to avoid overly optimistic entries
-                            ai_cap = 0.80
-                            if e_category in self.high_risk_categories:
-                                ai_cap = 0.65
+                            # Om Quant säger köp, lita på det – bara mjuk säkerhetscap (0.99); high-risk lite lägre (0.90)
+                            ai_cap = 0.90 if e_category in self.high_risk_categories else 0.99
                             ai_max_price = min(ai_max_price, ai_cap)
-                            edge = ai_max_price - current_price
-                            # Edge: stricter for price/high-risk, looser for preferred
-                            edge_req = self.min_edge_to_enter
-                            if is_price_market and e_category in self.high_risk_categories:
-                                edge_req = max(edge_req, 0.04)  # min 4 cent edge for price cases
-                            elif is_preferred:
-                                edge_req = max(edge_req * 0.8, 0.01)  # 20% lower edge for Sports/Elections
-                            if edge > edge_req and current_price <= ai_max_price:
-                                # Kelly: more for preferred, less for high-risk
+                            # Quant sa BUY – kräv bara att vi inte betalar över deras max (ingen extra edge-spärr)
+                            if current_price <= ai_max_price:
+                                # Kelly: samma för alla icke high-risk (alla kategorier med edge); mindre för high-risk
                                 if e_category in self.high_risk_categories:
                                     kelly_frac = 0.20 if not self.uncertain_market else 0.10
-                                elif is_preferred:
-                                    # Slightly more conservative Kelly even for preferred categories
+                                else:
                                     kelly_frac = 0.30 if self.uncertain_market else 0.45
-                                else:
-                                    kelly_frac = 0.20 if self.uncertain_market else 0.40
                                 bet = self.risk.calculate_kelly_bet(ai_max_price, current_price, balance, kelly_fraction=kelly_frac)
+                                # Kelly kan bli väldigt liten – använd minst X% av saldo
+                                bet_floor = balance * getattr(self, "min_bet_pct_balance", 0.05)
+                                bet = max(bet, bet_floor)
                                 bet = min(bet, self.max_bet_usdc)
-                                if bet >= 2.0:
-                                    price_now = self.polymarket.get_buy_price(token_id)
-                                    if price_now > ai_max_price:
-                                        print(f"   ⚠️ Price moved during analysis: {current_price:.2f} → {price_now:.2f}. Skipping buy.")
-                                        continue
-                                    # Tighter price band, especially for high-risk categories
-                                    price_cap = self.max_entry_price
-                                    if e_category in self.high_risk_categories:
-                                        price_cap = min(price_cap, 0.60)
-                                    if price_now < 0.10 or price_now > price_cap:
-                                        print(f"   ⚠️ Price out of band ({price_now:.2f} > {price_cap:.2f}). Skipping buy.")
-                                        continue
-                                    print(f"\n💎 Approved for buy. Price now: {price_now:.2f}. Placing order.")
-                                    market_to_buy = SimpleNamespace(
-                                        id=m_id, question=full_title, conditionId=market_data.get('conditionId'), active_token_id=token_id
-                                    )
-                                    order_id = self.polymarket.execute_market_order(market_to_buy, bet)
-                                    if order_id:
-                                        time.sleep(2)
+                                # Färskt pris (ingen cache) så vi inte skippar pga gammal data eller cache/CLOB-skillnad
+                                price_now = self.polymarket.get_buy_price(token_id, use_cache=False)
+                                # Tillåt rimlig rörelse (5¢ default) under analys; skippa bara vid tydlig flytt över vårt max
+                                price_tolerance = getattr(self, "price_move_tolerance", 0.05)
+                                if price_now > ai_max_price + price_tolerance:
+                                    print(f"   ⚠️ Price moved during analysis: {current_price:.2f} → {price_now:.2f} (max {ai_max_price}). Skipping buy.")
+                                    continue
+                                # Säkerhetsband: inte över vårt globala max; high-risk lite lägre
+                                price_cap = self.max_entry_price
+                                if e_category in self.high_risk_categories:
+                                    price_cap = min(price_cap, 0.85)
+                                min_p = getattr(self, "min_entry_price", 0.10)
+                                if price_now < min_p or price_now > price_cap:
+                                    print(f"   ⚠️ Price out of band ({price_now:.2f} > {price_cap:.2f}). Skipping buy.")
+                                    continue
+                                # Om vi ska köpa så köper vi alltid – tryck upp till minst $1 och 5 andelar (Polymarket-krav)
+                                min_bet_polymarket = max(self.min_bet_usdc, self.min_shares_to_buy * price_now)
+                                bet = max(bet, min_bet_polymarket)
+                                bet = min(bet, self.max_bet_usdc)
+                                if bet > balance:
+                                    print(f"   ⚠️ Saldo {balance:.2f} USDC räcker inte för {bet:.2f} USDC. Skipping.")
+                                    continue
+                                print(f"\n💎 Approved for buy. Price now: {price_now:.2f}. Placing order ({bet:.2f} USDC, ≥5 shares).")
+                                market_to_buy = SimpleNamespace(
+                                    id=m_id, question=full_title, conditionId=market_data.get('conditionId'), active_token_id=token_id
+                                )
+                                order_id = self.polymarket.execute_market_order(market_to_buy, bet)
+                                if order_id:
+                                    time.sleep(2)
+                                    actual_shares = self.polymarket.get_token_balance(token_id)
+                                    for _ in range(3):
+                                        if actual_shares and actual_shares >= 5.0:
+                                            break
+                                        time.sleep(3)
                                         actual_shares = self.polymarket.get_token_balance(token_id)
-                                        for _ in range(3):
-                                            if actual_shares and actual_shares >= 5.0:
-                                                break
-                                            time.sleep(3)
-                                            actual_shares = self.polymarket.get_token_balance(token_id)
-                                        actual_fill_price = round(bet / actual_shares, 3) if actual_shares and actual_shares > 0 else price_now
-                                        print(f"✅ Buy complete! Receipt: #{order_id} | Fill: {actual_fill_price:.3f} (shares: {actual_shares:.2f})")
-                                        _d_end = c.get("market_for_ai", {}).get("days_until_end")
-                                        _r_pct = price_context.get("range_pct", 0)
-                                        _hype = int(decision.get("hype_score") or 0)
-                                        target_price = compute_dynamic_target(
-                                            fill_price=actual_fill_price,
-                                            days_until_end=_d_end,
-                                            range_pct=_r_pct,
-                                            hype_score=_hype,
-                                            spread_pct=spread_pct,
-                                            ai_max_price=ai_max_price,
-                                            base_target_pct=self.profit_target,
-                                            high_target_pct=self.profit_target_high,
-                                            price_high_threshold=self.price_high_threshold,
-                                        )
-                                        self.db.log_new_trade(
-                                            token_id=token_id, market_id=m_id, question=full_title, buy_price=actual_fill_price,
-                                            amount_usdc=bet, shares_bought=actual_shares, notes=decision.get('reason', 'Buy approved'),
-                                            category=e_category, spread_pct=spread_pct, target_price=target_price, end_date_iso=end_date_str,
-                                            event_id=event_id or None,
-                                        )
-                                        print("💾 Order saved to DB.")
-                                        if actual_shares >= 5.0:
-                                            sell_ok = self.polymarket.execute_sell_order(token_id, actual_shares, target_price)
-                                            if not sell_ok:
-                                                time.sleep(5)
-                                                sell_ok = self.polymarket.execute_sell_order(token_id, self.polymarket.get_token_balance(token_id), target_price)
-                                            if sell_ok:
-                                                print(f"   📤 GTC sell order active: {target_price:.2f}")
-                                            else:
-                                                print(f"   ⚠️ GTC sell order failed – run restore_sell_orders.py at {target_price:.2f}")
-                                        if self.active_observer:
-                                            self.active_observer.add_token(token_id, actual_fill_price, full_title, target_price=target_price)
-                                            print(f"📡 WebSocket monitoring active.")
-                                        balance -= bet
-                                    else:
-                                        print("❌ Buy failed on-chain.")
+                                    actual_fill_price = round(bet / actual_shares, 3) if actual_shares and actual_shares > 0 else price_now
+                                    print(f"✅ Buy complete! Receipt: #{order_id} | Fill: {actual_fill_price:.3f} (shares: {actual_shares:.2f})")
+                                    _d_end = c.get("market_for_ai", {}).get("days_until_end")
+                                    _r_pct = price_context.get("range_pct", 0)
+                                    _hype = int(decision.get("hype_score") or 0)
+                                    target_price = compute_dynamic_target(
+                                        fill_price=actual_fill_price,
+                                        days_until_end=_d_end,
+                                        range_pct=_r_pct,
+                                        hype_score=_hype,
+                                        spread_pct=spread_pct,
+                                        ai_max_price=ai_max_price,
+                                        base_target_pct=self.profit_target,
+                                        high_target_pct=self.profit_target_high,
+                                        price_high_threshold=self.price_high_threshold,
+                                    )
+                                    self.db.log_new_trade(
+                                        token_id=token_id, market_id=m_id, question=full_title, buy_price=actual_fill_price,
+                                        amount_usdc=bet, shares_bought=actual_shares, notes=decision.get('reason', 'Buy approved'),
+                                        category=e_category, spread_pct=spread_pct, target_price=target_price, end_date_iso=end_date_str,
+                                        event_id=event_id or None,
+                                    )
+                                    print("💾 Order saved to DB.")
+                                    if actual_shares >= 5.0:
+                                        sell_ok = self.polymarket.execute_sell_order(token_id, actual_shares, target_price)
+                                        if not sell_ok:
+                                            time.sleep(5)
+                                            sell_ok = self.polymarket.execute_sell_order(token_id, self.polymarket.get_token_balance(token_id), target_price)
+                                        if sell_ok:
+                                            print(f"   📤 GTC sell order active: {target_price:.2f}")
+                                        else:
+                                            print(f"   ⚠️ GTC sell order failed – run restore_sell_orders.py at {target_price:.2f}")
+                                    if self.active_observer:
+                                        self.active_observer.add_token(token_id, actual_fill_price, full_title, target_price=target_price)
+                                        print(f"📡 WebSocket monitoring active.")
+                                    balance -= bet
                                 else:
-                                    print(f"   ⚠️ Bet too small ({bet:.2f} USDC).")
+                                    print("❌ Buy failed on-chain.")
                             else:
                                 msg = f"No edge (Price: {current_price} / AI Max: {ai_max_price})."
                                 print(f"   ⚠️ {msg}")
@@ -652,6 +680,7 @@ class Trade:
                             reason = decision.get('reason', '')
                             if "Gatekeeper" in reason or "Lawyer" in reason:
                                 skip_rest = True
+                    print("─" * 60, flush=True)
                     return (balance, skip_rest)
 
                 # 3. Consumer: pull from scanner queue, run War Room (Bouncer already in scanner)
@@ -666,9 +695,13 @@ class Trade:
                 if not batch_list:
                     self._consumer_empty_count = getattr(self, "_consumer_empty_count", 0) + 1
                     if self._consumer_empty_count == 1 or self._consumer_empty_count % 6 == 0:
-                        print(f"\n⏳ No candidates in queue – waiting for scanner (Bouncer PASS)... ({self._consumer_empty_count}x timeout)")
+                        print(f"\n💵 Balance: {balance:.2f} USDC", flush=True)
+                        self._log_to_live(f"💓 Heartbeat | Balance: {balance:.2f} USDC")
+                        print(f"⏳ No candidates in queue – väntar på scanner… ({self._consumer_empty_count}x)", flush=True)
                     time.sleep(5)
                     continue
+                print(f"\n💵 Balance: {balance:.2f} USDC")
+                self._log_to_live(f"💓 Heartbeat | Balance: {balance:.2f} USDC")
                 batch_list = [c for c in batch_list if c.get("market_for_ai") and c.get("full_title")]
                 if not batch_list:
                     continue
@@ -685,11 +718,13 @@ class Trade:
                         c["market_for_ai"]["similar_analyses"] = _bcc.get_similar_analyses_context(c["full_title"], k=3)
                     except Exception:
                         pass
-                print(f"\n🧠 War Room analyzing {len(batch_list)} candidate(s):")
+                print("\n" + "═" * 60, flush=True)
+                print("🧠 WAR ROOM – analyserar " + str(len(batch_list)) + " kandidat(er)", flush=True)
+                print("═" * 60, flush=True)
                 for c in batch_list:
-                    cat = c.get("e_category") or "?"
-                    price = c.get("current_price", 0)
-                    print(f"   📊 [{cat}] {c['full_title'][:70]} @ {price:.2f}")
+                    title = str(c.get("full_title") or "")[:56]
+                    price = float(c.get("current_price") or 0)
+                    print("   • " + title + " @ " + f"{price:.2f}", flush=True)
                 try:
                     balance, _ = run_batch(batch_list, balance, skip_bouncer=True)
                 except Exception as batch_err:
