@@ -34,31 +34,46 @@ pip install -r requirements.txt   # om/ när requirements finns
 
 ### Miljövariabler (`.env`)
 
-Exempel (utan riktiga nycklar):
-
-```env
-# Wallet / kedja
-PRIVATE_KEY=0x...
-SETTLER_PRIVATE_KEY=0x...
-POLYGON_WALLET_PRIVATE_KEY=0x...
-POLYMARKET_FUNDER_ADDRESS=0x...
-POLYGON_CONFIG_MAINNET_RPC_URL=https://polygon-mainnet.g.alchemy.com/v2/...
-
-# AI / research
-OPENAI_API_KEY=...
-TAVILY_API_KEY=...
-NEWSAPI_API_KEY=...
-XAI_API_KEY=...
-DEEPSEEK_API_KEY=...
-ANTHROPIC_API_KEY=...
-
-# Magnus-beteende (default räcker oftast)
-MAGNUS_UNCERTAIN_MARKET=1
-MAGNUS_MAX_DRAWDOWN_PCT=100
-MAGNUS_MAX_CORRELATED=5
-```
-
 Alla hemliga värden hålls **endast** i `.env` (som är ignorerad av `.gitignore`).
+
+För att komma igång:
+
+1. Kopiera mallen:
+
+   ```bash
+   cp .env.example .env
+   ```
+
+2. Fyll i dina egna värden i `.env`:
+   - `PRIVATE_KEY` – privata nyckeln för bot‑walleten på Polygon.
+   - `POLYMARKET_FUNDER_ADDRESS` – adressen som håller USDC.e (samma som i Polymarket UI).
+   - `POLYGON_CONFIG_MAINNET_RPC_URL` – din egen Alchemy/Infura‑URL.
+   - AI‑nycklar: `OPENAI_API_KEY`, `DEEPSEEK_API_KEY`, `ANTHROPIC_API_KEY`, `XAI_API_KEY`, `TAVILY_API_KEY`, `NEWSAPI_API_KEY`.
+
+3. Skapa CLOB USER‑API‑nycklar (L2) via SDK:
+
+   ```bash
+   # från projektroten, med PRIVATE_KEY satt i .env
+   python -m scripts.python.create_polymarket_api_creds
+   ```
+
+   Skriptet skriver ut:
+
+   ```json
+   {
+     "USER_API_KEY": "...",
+     "USER_API_SECRET": "...",
+     "USER_API_PASSPHRASE": "..."
+   }
+   ```
+
+   Kopiera dessa värden in i `.env`:
+
+   ```env
+   USER_API_KEY=...
+   USER_API_SECRET=...
+   USER_API_PASSPHRASE=...
+   ```
 
 ### Köra Magnus (Sniper Mode)
 

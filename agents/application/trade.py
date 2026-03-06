@@ -69,6 +69,11 @@ class Trade:
             self.min_bet_pct_balance = float(os.getenv("MAGNUS_MIN_BET_PCT_BALANCE", "0.08"))
         except ValueError:
             self.min_bet_pct_balance = 0.08   # 8% av saldo som minst vid godkänt köp (36 USDC → ~2.9 USDC)
+        # Minsta brutto‑profit per trade (USDC) – så avgifter blir en del av vinsten, inte hela vinsten.
+        try:
+            self.min_gross_profit_usdc = float(os.getenv("MAGNUS_MIN_GROSS_PROFIT_USDC", "0.25"))
+        except ValueError:
+            self.min_gross_profit_usdc = 0.25
         # Tighter stop-loss to improve risk/reward
         self.stop_loss_pct = 0.15
         # Bred band så nästan-avgjorda (0.1¢–99.9¢) når analys; Quant avvisar om ingen edge
@@ -80,9 +85,11 @@ class Trade:
             self.max_entry_price = float(os.getenv("MAGNUS_MAX_ENTRY_PRICE", "0.999"))
         except ValueError:
             self.max_entry_price = 0.999
-        # Markets we historically lose on – skip (title match). Bitcoin kan stängas av med MAGNUS_SKIP_BITCOIN=0
+        # Markets we historically lose on – skip (title match).
+        # Elon Musk tweet-räknare = ren brus; de ger edge dåligt och skippas alltid.
+        # Bitcoin-marknader: default = TILLÅT (MAGNUS_SKIP_BITCOIN=0). Sätt MAGNUS_SKIP_BITCOIN=1 i .env om du vill blocka dem.
         self.skip_title_patterns = [("elon musk", "tweet")]
-        if os.getenv("MAGNUS_SKIP_BITCOIN", "1").strip().lower() in ("1", "true", "yes"):
+        if os.getenv("MAGNUS_SKIP_BITCOIN", "0").strip().lower() in ("1", "true", "yes"):
             self.skip_title_patterns.append(("bitcoin", None))
         # 0 = köp även om pris inte är under snitt (rekommenderat så Quant-BUY faktiskt blir köp)
         self.require_below_avg = os.getenv("MAGNUS_REQUIRE_BELOW_AVG", "0").strip().lower() not in ("0", "false", "no")
@@ -109,6 +116,11 @@ class Trade:
             self.max_spread_pct = float(os.getenv("MAGNUS_MAX_SPREAD_PCT", "95.0"))
         except ValueError:
             self.max_spread_pct = 95.0
+        # Min dagar kvar innan vi tillåter köp (default 0.2 ≈ 5 h). Sätt 0 för att inte blockera på tid när Quant säger BUY.
+        try:
+            self.min_days_to_buy = float(os.getenv("MAGNUS_MIN_DAYS_TO_BUY", "0.2"))
+        except ValueError:
+            self.min_days_to_buy = 0.2
         # Återhandla marknad efter N dagar (0 = aldrig). Fler kandidater om poolen "torkat".
         try:
             self.allow_retrade_after_days = int(os.getenv("MAGNUS_ALLOW_RETRADE_AFTER_DAYS", "0"))
@@ -435,18 +447,22 @@ class Trade:
         candidate_queue = queue.Queue(maxsize=500)
         # Scan cadence and dedup TTL can be tuned via env
         try:
-            scan_interval = int(os.getenv("MAGNUS_SCAN_INTERVAL_SECONDS", "1800"))  # default: 30 minutes
+            scan_interval = int(os.getenv("MAGNUS_SCAN_INTERVAL_SECONDS", "900"))  # default: 15 min – fler scannerrundor, fler kandidater
         except ValueError:
-            scan_interval = 1800
+            scan_interval = 900
         try:
-            dedup_ttl = int(os.getenv("MAGNUS_DEDUP_TTL_SECONDS", "21600"))  # default: 6 hours
+            dedup_ttl = int(os.getenv("MAGNUS_DEDUP_TTL_SECONDS", "3600"))  # default: 1 hour – fler når Quant
         except ValueError:
-            dedup_ttl = 21600
+            dedup_ttl = 3600
+        try:
+            event_limit = int(os.getenv("MAGNUS_SCANNER_EVENT_LIMIT", "2500"))  # events per strategy; höj för fler kandidater
+        except ValueError:
+            event_limit = 2500
         scanner = MarketScanner(
             candidate_queue,
             self,
             strategies=["trending", "featured", "new"],  # trending + new = många events; featured = ~21 från API
-            event_limit=2000,
+            event_limit=event_limit,
             dedup_ttl_seconds=dedup_ttl,
             sleep_between_rounds_seconds=scan_interval,
         )
@@ -488,6 +504,7 @@ class Trade:
                     except Exception as war_err:
                         err_short = str(war_err)[:120]
                         print(f"\n⚠️ War Room error (batch): {err_short}")
+                        logger.exception("War Room batch error: %s", err_short)
                         self._log_to_live(f"⚠️ War Room batch error: {err_short}")
                         results = [{"action": "REJECT", "reason": f"Error: {war_err}", "max_price": 0.0, "hype_score": 0} for _ in batch_list]
                     for c, raw in zip(batch_list, results):
@@ -499,6 +516,7 @@ class Trade:
                         decision["max_price"] = float(decision.get("max_price") or 0)
                         decision["reason"] = (str(decision.get("reason") or ""))[:500]
                         decision["hype_score"] = int(decision.get("hype_score") or 0)
+
                         full_title = c["full_title"]
                         e_category = c["e_category"]
                         current_price = c["current_price"]
@@ -509,6 +527,68 @@ class Trade:
                         spread_pct = c["spread_pct"]
                         bid, ask = c["bid"], c["ask"]
                         end_date_str = c["end_date_str"]
+
+                        # Fallback‑heuristik: om Quant är överdrivet försiktig men vi ser tydlig edge
+                        # (hög hype, pris i nedre delen av range, tillräcklig volatilitet och tid kvar),
+                        # tvinga fram ett BUY med konservativ MAX_PRICE. Detta är en "second opinion"
+                        # ovanpå DeepSeek, inte ett extra filter.
+                        if decision["action"] == "REJECT":
+                            hype = decision["hype_score"]
+                            pc = price_context or {}
+                            days_until_end = c.get("market_for_ai", {}).get("days_until_end")
+                            spread_here = spread_pct
+                            range_pct = float(pc.get("range_pct") or 0.0)
+                            in_lower_half = bool(pc.get("in_lower_half"))
+                            near_low = bool(pc.get("near_historical_low"))
+                            # Lätta: hype 6+, range 3%+, 0.5+ dagar kvar – fler REJECT blir BUY när edge finns.
+                            if (
+                                isinstance(hype, int) and hype >= 6
+                                and (in_lower_half or near_low)
+                                and range_pct >= 3.0
+                                and (days_until_end is None or days_until_end >= 0.5)
+                                and (spread_here is None or spread_here <= self.max_spread_pct)
+                            ):
+                                edge_floor = getattr(self, "min_edge_to_enter", 0.015)
+                                # Konservativt maxpris: lite över nuvarande, med tak per riskkategori.
+                                safe_cap = 0.85 if e_category in self.high_risk_categories else 0.92
+                                max_price_auto = min(current_price + edge_floor, safe_cap)
+                                decision["action"] = "BUY"
+                                decision["max_price"] = max_price_auto
+                                auto_reason = (
+                                    f"Auto-BUY by fallback heuristic (hype={hype}, "
+                                    f"range={range_pct}%, lower_range={in_lower_half or near_low}). "
+                                    f"MAX_PRICE set to {max_price_auto:.3f}."
+                                )
+                                # Behåll ursprunglig Quant‑reason för transparens i DB, men logga auto‑heuristik separat.
+                                self._log_to_live(f"🤖 Fallback BUY override: {auto_reason[:180]}")
+                        # region agent log
+                        try:
+                            import json as _json  # lokal alias för debug-loggning
+                            with open("/home/kim/agents/.cursor/debug-ed1d60.log", "a", encoding="utf-8") as _fdbg:
+                                _fdbg.write(
+                                    _json.dumps(
+                                        {
+                                            "sessionId": "ed1d60",
+                                            "runId": "pre-fix",
+                                            "hypothesisId": "H2",
+                                            "location": "trade.py:run_batch",
+                                            "message": "war_room_decision",
+                                            "data": {
+                                                "question": (full_title or "")[:120],
+                                                "category": e_category,
+                                                "action": decision.get("action", "REJECT"),
+                                                "max_price": decision.get("max_price", 0),
+                                                "current_price": current_price,
+                                                "hype": int(decision.get("hype_score", 0)),
+                                            },
+                                            "timestamp": int(time.time() * 1000),
+                                        }
+                                    )
+                                    + "\n"
+                                )
+                        except Exception:
+                            pass
+                        # endregion
                         self.db.log_analysis(
                             question=full_title, category=e_category,
                             action=decision.get("action", "REJECT"), reason=decision.get("reason", ""),
@@ -523,6 +603,32 @@ class Trade:
                         else:
                             print(f"   → APPROVED: {title_short} | max {decision.get('max_price', 0):.2f}", flush=True)
                         if decision.get('action') == "BUY":
+                            # region agent log
+                            try:
+                                import json as _json  # lokal alias för debug-loggning
+                                with open("/home/kim/agents/.cursor/debug-ed1d60.log", "a", encoding="utf-8") as _fdbg:
+                                    _fdbg.write(
+                                        _json.dumps(
+                                            {
+                                                "sessionId": "ed1d60",
+                                                "runId": "pre-fix",
+                                                "hypothesisId": "H3",
+                                                "location": "trade.py:BUY_block",
+                                                "message": "buy_block_enter",
+                                                "data": {
+                                                    "question": (full_title or "")[:120],
+                                                    "category": e_category,
+                                                    "ai_max_price": decision.get("max_price", 0),
+                                                    "current_price": current_price,
+                                                },
+                                                "timestamp": int(time.time() * 1000),
+                                            }
+                                        )
+                                        + "\n"
+                                    )
+                            except Exception:
+                                pass
+                            # endregion
                             # Balanced events (sport): max 1 buy; others (ETH levels): max N
                             event_id = (c.get("event_id") or "").strip()
                             if event_id and not self._allow_more_positions_in_event(event_id, e_category):
@@ -552,9 +658,10 @@ class Trade:
                             ):
                                 print(f"   ⏸️ Short-term momentum too negative ({change_1h}%). Skipping buy.")
                                 continue
-                            if days_until_end is not None and isinstance(days_until_end, (int, float)) and days_until_end < 0.5:
-                                self._log_to_live("⏸️ Too little time left (< 0.5 day). Skipping buy.")
-                                print(f"   ⏸️ Too little time left (< 0.5 day). Skipping buy.")
+                            min_days = getattr(self, "min_days_to_buy", 0.2)
+                            if days_until_end is not None and isinstance(days_until_end, (int, float)) and min_days > 0 and days_until_end < min_days:
+                                self._log_to_live(f"⏸️ Too little time left (< {min_days} day). Skipping buy.")
+                                print(f"   ⏸️ Too little time left (< {min_days} day). Skipping buy.")
                                 continue
                             open_count = len(self.db.get_open_positions())
                             if open_count >= self.max_open_positions:
@@ -621,11 +728,81 @@ class Trade:
                                 if bet > balance:
                                     print(f"   ⚠️ Saldo {balance:.2f} USDC räcker inte för {bet:.2f} USDC. Skipping.")
                                     continue
+                                # Säkerställ att förväntad brutto‑profit i USDC är värd avgifter och risk.
+                                edge_per_share = max(0.0, ai_max_price - price_now)
+                                if edge_per_share <= 0:
+                                    msg = f"Expected edge per share ≤ 0 (max {ai_max_price:.3f} vs price {price_now:.3f}). Skipping."
+                                    print(f"   ⚠️ {msg}")
+                                    self._log_to_live(f"⚠️ {msg}")
+                                    continue
+                                est_shares = bet / price_now if price_now > 0 else 0.0
+                                est_gross_profit = edge_per_share * est_shares
+                                if est_gross_profit < getattr(self, "min_gross_profit_usdc", 0.0):
+                                    msg = (
+                                        f"Estimated gross profit {est_gross_profit:.3f} USDC below "
+                                        f"threshold {self.min_gross_profit_usdc:.3f}. Skipping buy."
+                                    )
+                                    print(f"   ⚠️ {msg}")
+                                    self._log_to_live(f"⚠️ {msg}")
+                                    continue
                                 print(f"\n💎 Approved for buy. Price now: {price_now:.2f}. Placing order ({bet:.2f} USDC, ≥5 shares).")
+                                # region agent log
+                                try:
+                                    import json as _json  # lokal alias för debug-loggning
+                                    with open("/home/kim/agents/.cursor/debug-ed1d60.log", "a", encoding="utf-8") as _fdbg:
+                                        _fdbg.write(
+                                            _json.dumps(
+                                                {
+                                                    "sessionId": "ed1d60",
+                                                    "runId": "pre-fix",
+                                                    "hypothesisId": "H4",
+                                                    "location": "trade.py:execute_market_order",
+                                                    "message": "place_order",
+                                                    "data": {
+                                                        "question": (full_title or "")[:120],
+                                                        "category": e_category,
+                                                        "price_now": price_now,
+                                                        "ai_max_price": ai_max_price,
+                                                        "bet": bet,
+                                                        "balance": balance,
+                                                    },
+                                                    "timestamp": int(time.time() * 1000),
+                                                }
+                                            )
+                                            + "\n"
+                                        )
+                                except Exception:
+                                    pass
+                                # endregion
                                 market_to_buy = SimpleNamespace(
                                     id=m_id, question=full_title, conditionId=market_data.get('conditionId'), active_token_id=token_id
                                 )
-                                order_id = self.polymarket.execute_market_order(market_to_buy, bet)
+                                order_id = self.polymarket.execute_market_order(market_to_buy, bet, max_price=ai_max_price)
+                                # region agent log
+                                try:
+                                    import json as _json  # lokal alias för debug-loggning
+                                    with open("/home/kim/agents/.cursor/debug-ed1d60.log", "a", encoding="utf-8") as _fdbg:
+                                        _fdbg.write(
+                                            _json.dumps(
+                                                {
+                                                    "sessionId": "ed1d60",
+                                                    "runId": "pre-fix",
+                                                    "hypothesisId": "H4",
+                                                    "location": "trade.py:execute_market_order",
+                                                    "message": "execute_market_order_return",
+                                                    "data": {
+                                                        "question": (full_title or "")[:120],
+                                                        "token_id": str(token_id),
+                                                        "order_id": str(order_id) if order_id else None,
+                                                    },
+                                                    "timestamp": int(time.time() * 1000),
+                                                }
+                                            )
+                                            + "\n"
+                                        )
+                                except Exception:
+                                    pass
+                                # endregion
                                 if order_id:
                                     time.sleep(2)
                                     actual_shares = self.polymarket.get_token_balance(token_id)
@@ -684,7 +861,11 @@ class Trade:
                     return (balance, skip_rest)
 
                 # 3. Consumer: pull from scanner queue, run War Room (Bouncer already in scanner)
-                WAR_ROOM_BATCH_SIZE = 2
+                try:
+                    WAR_ROOM_BATCH_SIZE = int(os.getenv("MAGNUS_WAR_ROOM_BATCH_SIZE", "8"))
+                except ValueError:
+                    WAR_ROOM_BATCH_SIZE = 8
+                WAR_ROOM_BATCH_SIZE = max(1, min(WAR_ROOM_BATCH_SIZE, 8))
                 batch_list = []
                 for _ in range(WAR_ROOM_BATCH_SIZE):
                     try:
@@ -729,8 +910,10 @@ class Trade:
                     balance, _ = run_batch(batch_list, balance, skip_bouncer=True)
                 except Exception as batch_err:
                     print(f"\n⚠️ Consumer run_batch error: {batch_err}")
+                    logger.exception("Consumer run_batch error")
                     traceback.print_exc()
 
             except Exception:
+                logger.exception("Sniper loop exception")
                 traceback.print_exc()
                 time.sleep(30)

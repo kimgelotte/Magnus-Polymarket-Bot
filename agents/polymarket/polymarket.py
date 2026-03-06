@@ -1,9 +1,12 @@
+import logging
 import os
 import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
+
+logger = logging.getLogger("magnus.polymarket")
 from dotenv import load_dotenv
 
 from py_clob_client.client import ClobClient
@@ -13,6 +16,8 @@ from py_clob_client.clob_types import (
     BalanceAllowanceParams,
     MarketOrderArgs,
     BookParams,
+    OrderType,
+    OrderArgs,
 )
 
 
@@ -63,7 +68,8 @@ class Polymarket:
         try:
             if user_key and user_secret and user_pass:
                 # Manuell User‑API – t.ex. om L1‑endpoints strular.
-                manual = ApiCreds(key=user_key, secret=user_secret, passphrase=user_pass)
+                # ApiCreds-fält enligt py_clob_client: api_key, api_secret, api_passphrase.
+                manual = ApiCreds(api_key=user_key, api_secret=user_secret, api_passphrase=user_pass)
                 self.client.set_api_creds(manual)
                 self.api_creds = manual
                 try:
@@ -92,6 +98,8 @@ class Polymarket:
         self._cache_book: Dict[str, Tuple[Tuple[Optional[float], Optional[float], float], float]] = {}
         self._cache_history: Dict[str, Tuple[List[Dict[str, Any]], float]] = {}
         self._cache_lock = threading.Lock()
+        # Vid get_balance_allowance-fel använd senast lyckade saldo så vi inte visar 0 och pausar onödigt.
+        self._last_balance: Optional[float] = None
 
     def _get_cached(self, cache: Dict[str, Tuple[Any, float]], key: str) -> Any:
         with self._cache_lock:
@@ -338,8 +346,10 @@ class Polymarket:
             params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL, signature_type=sig_type)
             data = self.client.get_balance_allowance(params)
         except Exception as e:
-            # Hjälp vid felsökning när Magnus visar 0 USDC trots saldo i UI.
-            print(f"⚠️ [Polymarket] get_balance_allowance error: {e}")
+            # Vid fel: använd cache om vi har; logga bara när vi saknar cache (returnerar 0) så brus minskar.
+            if self._last_balance is not None:
+                return float(self._last_balance)
+            logger.warning("get_balance_allowance error (no cache): %s", e)
             return 0.0
 
         if isinstance(data, dict):
@@ -350,7 +360,9 @@ class Polymarket:
                 # Fallback: om CLOB rapporterar 0 men det finns on‑chain USDC.e på funder‑adressen,
                 # använd det on‑chain‑saldot som "Balance" internt så Magnus kan fortsätta arbeta.
                 if clob_balance == 0.0 and onchain is not None and onchain > 0:
-                    return float(onchain)
+                    self._last_balance = float(onchain)
+                    return self._last_balance
+                self._last_balance = clob_balance
                 return clob_balance
             except (TypeError, ValueError):
                 print(f"⚠️ [Polymarket] Ogiltigt balance‑värde i svar: {(str(bal)[:80])!r}")
@@ -398,7 +410,38 @@ class Polymarket:
 
     # --- Orders ------------------------------------------------------------------
 
-    def execute_market_order(self, market_to_buy, amount_usdc: float) -> Optional[str]:
+    def _get_ask_liquidity_usdc(self, token_id: str, levels: int = 3) -> Tuple[float, Optional[float]]:
+        """
+        Grov uppskattning av hur mycket USDC vi realistiskt kan spendera direkt mot
+        bokens ask-sida utan att trigga FOK-"no match", samt bästa ask-pris.
+
+        Vi summerar pris * size för de första N ask-nivåerna och tolkar det som
+        max "marknadsvärde" som faktiskt finns att slå emot just nu.
+        """
+        try:
+            book = self.client.get_order_book(str(token_id))
+        except Exception:
+            return 0.0, None
+
+        asks = getattr(book, "asks", None) or []
+        total = 0.0
+        best_ask: Optional[float] = None
+        for idx, lvl in enumerate(asks[: max(1, int(levels))]):
+            try:
+                price = float(getattr(lvl, "price", 0) or 0)
+                if price > 1.0:
+                    price = price / 100.0
+                size = float(getattr(lvl, "size", 0) or 0)
+                if price <= 0 or size <= 0:
+                    continue
+                if idx == 0:
+                    best_ask = price
+                total += price * size
+            except (TypeError, ValueError):
+                continue
+        return total, best_ask
+
+    def execute_market_order(self, market_to_buy, amount_usdc: float, max_price: Optional[float] = None) -> Optional[str]:
         """
         Lägger en market‑BUY order i USDC på active_token_id.
         Returnerar orderId vid OK, annars None.
@@ -409,31 +452,379 @@ class Polymarket:
         """
         token_id = str(getattr(market_to_buy, "active_token_id"))
         try:
-            args = MarketOrderArgs(
-                token_id=token_id,
-                amount=float(amount_usdc),
-                side="BUY",
-            )
-            order = self.client.create_market_order(args)
-            res = self.client.post_order(order)
-            if not res:
-                print(f"⚠️ [Polymarket] post_order returned empty response for token {token_id} (amount {amount_usdc}).")
-                return None
-            if isinstance(res, dict) and res.get("error"):
-                err = res.get("error")
-                err_str = (err.get("message") if isinstance(err, dict) else str(err)) if err is not None else "Unknown error"
-                print(f"⚠️ [Polymarket] post_order error for token {token_id}: {err_str[:160]}")
-                return None
-            order_id = None
-            if isinstance(res, dict):
-                order_id = res.get("orderId") or res.get("order_id")
-            if not order_id:
-                # Oväntad struktur – logga trunkerat svar.
-                print(f"⚠️ [Polymarket] post_order unexpected response for token {token_id}: {(str(res)[:200])!r}")
-                return None
-            return order_id
+            # FOK‑order måste kunna fylla *hela* beloppet direkt, annars returnerar CLOB
+            # ett "no match" trots att det finns viss likviditet. Det är troligen det
+            # du ser i loggen: vi ber om större USDC‑belopp än vad som finns på ask‑sidan.
+            #
+            # Lösning: clamp:a orderbeloppet mot faktisk ask‑likviditet (top N nivåer)
+            # så att vi inte försöker köpa mer än som faktiskt kan fyllas.
+            raw_amount = float(amount_usdc)
+            ask_liq, best_ask = self._get_ask_liquidity_usdc(token_id)
+            effective_amount = raw_amount
+            # region agent log
+            try:
+                import json as _json
+                with open("/home/kim/agents/.cursor/debug-ed1d60.log", "a", encoding="utf-8") as _fdbg:
+                    _fdbg.write(
+                        _json.dumps(
+                            {
+                                "sessionId": "ed1d60",
+                                "runId": "pre-fix",
+                                "hypothesisId": "H4",
+                                "location": "polymarket.py:execute_market_order",
+                                "message": "execute_market_order_entry",
+                                "data": {
+                                    "token_id": token_id,
+                                    "raw_amount": raw_amount,
+                                    "max_price": float(max_price) if max_price is not None else None,
+                                    "ask_liq_usdc": float(ask_liq),
+                                    "best_ask": float(best_ask) if best_ask else None,
+                                },
+                                "timestamp": int(time.time() * 1000),
+                            }
+                        )
+                        + "\n"
+                    )
+            except Exception:
+                pass
+            # endregion
+
+            # Fall 1: det finns asks → försök taker‑FOK mot befintlig likviditet.
+            if ask_liq > 0:
+                # Minimikrav: minst 1 USDC och minst 5 andelar på ask-sidan.
+                min_amount = 1.0
+                if best_ask and best_ask > 0:
+                    min_amount = max(min_amount, best_ask * 5.0)
+
+                # Om totala ask‑likviditeten inte ens räcker till 5 andelar → köp är omöjligt enligt våra regler.
+                if ask_liq < min_amount:
+                    print(
+                        f"⚠️ [Polymarket] Ask liquidity {ask_liq:.4f} too low for min buy on token {token_id} "
+                        f"(best_ask={best_ask}, min_amount={min_amount:.2f})."
+                    )
+                    # region agent log
+                    try:
+                        import json as _json
+                        with open("/home/kim/agents/.cursor/debug-ed1d60.log", "a", encoding="utf-8") as _fdbg:
+                            _fdbg.write(
+                                _json.dumps(
+                                    {
+                                        "sessionId": "ed1d60",
+                                        "runId": "pre-fix",
+                                        "hypothesisId": "H4",
+                                        "location": "polymarket.py:execute_market_order",
+                                        "message": "execute_market_order_abort_low_ask_liq",
+                                        "data": {"token_id": token_id, "ask_liq_usdc": float(ask_liq), "min_amount": float(min_amount), "best_ask": float(best_ask) if best_ask else None},
+                                        "timestamp": int(time.time() * 1000),
+                                    }
+                                )
+                                + "\n"
+                            )
+                    except Exception:
+                        pass
+                    # endregion
+                    return None
+
+                # Vi kan aldrig köpa mer än det som faktiskt finns på ask-sidan.
+                max_safe = ask_liq
+                if effective_amount > max_safe:
+                    print(
+                        f"ℹ️ [Polymarket] Clamping market BUY amount from {effective_amount:.2f} to "
+                        f"{max_safe:.2f} USDC based on available ask liquidity."
+                    )
+                    effective_amount = max_safe
+
+                if effective_amount < min_amount:
+                    # Vår planerade size är mindre än vad som krävs för 5 andelar / 1 USDC – justera upp till min_amount
+                    # om det ryms inom ask_liq.
+                    if max_safe >= min_amount:
+                        print(
+                            f"ℹ️ [Polymarket] Raising market BUY amount from {effective_amount:.2f} to "
+                            f"{min_amount:.2f} USDC to satisfy 5-shares/1-USDC constraint."
+                        )
+                        effective_amount = min_amount
+                    else:
+                        print(
+                            f"⚠️ [Polymarket] Cannot satisfy min buy constraints for token {token_id} "
+                            f"(effective_amount={effective_amount:.2f}, min_amount={min_amount:.2f}, ask_liq={ask_liq:.4f})."
+                        )
+                        return None
+
+                args = MarketOrderArgs(
+                    token_id=token_id,
+                    amount=effective_amount,
+                    side="BUY",
+                    order_type=OrderType.FOK,
+                )
+                order = self.client.create_market_order(args)
+                res = self.client.post_order(order)
+                if not res:
+                    print(f"⚠️ [Polymarket] post_order returned empty response for token {token_id} (amount {effective_amount}).")
+                    # region agent log
+                    try:
+                        import json as _json
+                        with open("/home/kim/agents/.cursor/debug-ed1d60.log", "a", encoding="utf-8") as _fdbg:
+                            _fdbg.write(
+                                _json.dumps(
+                                    {
+                                        "sessionId": "ed1d60",
+                                        "runId": "pre-fix",
+                                        "hypothesisId": "H4",
+                                        "location": "polymarket.py:execute_market_order",
+                                        "message": "execute_market_order_post_order_empty",
+                                        "data": {"token_id": token_id, "effective_amount": float(effective_amount)},
+                                        "timestamp": int(time.time() * 1000),
+                                    }
+                                )
+                                + "\n"
+                            )
+                    except Exception:
+                        pass
+                    # endregion
+                    return None
+                if isinstance(res, dict) and res.get("error"):
+                    err = res.get("error")
+                    err_str = (err.get("message") if isinstance(err, dict) else str(err)) if err is not None else "Unknown error"
+                    print(f"⚠️ [Polymarket] post_order error for token {token_id}: {err_str[:160]}")
+                    # region agent log
+                    try:
+                        import json as _json
+                        with open("/home/kim/agents/.cursor/debug-ed1d60.log", "a", encoding="utf-8") as _fdbg:
+                            _fdbg.write(
+                                _json.dumps(
+                                    {
+                                        "sessionId": "ed1d60",
+                                        "runId": "pre-fix",
+                                        "hypothesisId": "H4",
+                                        "location": "polymarket.py:execute_market_order",
+                                        "message": "execute_market_order_post_order_error",
+                                        "data": {"token_id": token_id, "error": err_str[:200]},
+                                        "timestamp": int(time.time() * 1000),
+                                    }
+                                )
+                                + "\n"
+                            )
+                    except Exception:
+                        pass
+                    # endregion
+                    return None
+                order_id = None
+                if isinstance(res, dict):
+                    order_id = res.get("orderId") or res.get("order_id")
+                if not order_id:
+                    # Oväntad struktur – logga trunkerat svar.
+                    print(f"⚠️ [Polymarket] post_order unexpected response for token {token_id}: {(str(res)[:200])!r}")
+                    # region agent log
+                    try:
+                        import json as _json
+                        with open("/home/kim/agents/.cursor/debug-ed1d60.log", "a", encoding="utf-8") as _fdbg:
+                            _fdbg.write(
+                                _json.dumps(
+                                    {
+                                        "sessionId": "ed1d60",
+                                        "runId": "pre-fix",
+                                        "hypothesisId": "H4",
+                                        "location": "polymarket.py:execute_market_order",
+                                        "message": "execute_market_order_unexpected_response",
+                                        "data": {"token_id": token_id, "res": str(res)[:220]},
+                                        "timestamp": int(time.time() * 1000),
+                                    }
+                                )
+                                + "\n"
+                            )
+                    except Exception:
+                        pass
+                    # endregion
+                    return None
+                # region agent log
+                try:
+                    import json as _json
+                    with open("/home/kim/agents/.cursor/debug-ed1d60.log", "a", encoding="utf-8") as _fdbg:
+                        _fdbg.write(
+                            _json.dumps(
+                                {
+                                    "sessionId": "ed1d60",
+                                    "runId": "pre-fix",
+                                    "hypothesisId": "H4",
+                                    "location": "polymarket.py:execute_market_order",
+                                    "message": "execute_market_order_success",
+                                    "data": {"token_id": token_id, "order_id": str(order_id)},
+                                    "timestamp": int(time.time() * 1000),
+                                }
+                            )
+                            + "\n"
+                        )
+                except Exception:
+                    pass
+                # endregion
+                return order_id
+
+            # Fall 2: ingen ask‑likviditet → agera maker med limit‑BUY (GTC) om vi har ett takpris.
+            if ask_liq <= 0:
+                if max_price is None or max_price <= 0:
+                    print(f"⚠️ [Polymarket] No ask liquidity and no MAX_PRICE for token {token_id}; skipping buy.")
+                    return None
+
+                # Minsta belopp: 1 USDC (Polymarket-krav på orderstorlek).
+                if raw_amount < 1.0:
+                    print(f"⚠️ [Polymarket] Amount {raw_amount:.2f} < 1.0 USDC for maker BUY on token {token_id}; skipping.")
+                    return None
+
+                # Vi vill både:
+                #  - hålla oss under vårt takpris (max_price),
+                #  - och kunna köpa minst 5 andelar med det belopp vi tänker riskera.
+                #
+                # För att göra det sätter vi ett initialt tak på priset,
+                # och om det inte räcker till 5 shares justerar vi priset nedåt tills 5 shares blir möjliga.
+                limit_price_cap = float(max(0.01, min(max_price, 0.99)))
+                # Pris som gör att vi precis får 5 shares med raw_amount.
+                price_for_five = raw_amount / 5.0
+                # Slutligt limitpris = min(takkap, pris-för-5-shares)
+                limit_price = max(0.01, min(limit_price_cap, price_for_five))
+                est_shares = raw_amount / limit_price if limit_price > 0 else 0.0
+                # region agent log
+                try:
+                    import json as _json
+                    with open("/home/kim/agents/.cursor/debug-ed1d60.log", "a", encoding="utf-8") as _fdbg:
+                        _fdbg.write(
+                            _json.dumps(
+                                {
+                                    "sessionId": "ed1d60",
+                                    "runId": "pre-fix",
+                                    "hypothesisId": "H5",
+                                    "location": "polymarket.py:execute_market_order",
+                                    "message": "maker_price_and_size",
+                                    "data": {
+                                        "token_id": token_id,
+                                        "raw_amount": float(raw_amount),
+                                        "limit_price_cap": float(limit_price_cap),
+                                        "price_for_five": float(price_for_five),
+                                        "limit_price": float(limit_price),
+                                        "est_shares": float(est_shares),
+                                    },
+                                    "timestamp": int(time.time() * 1000),
+                                }
+                            )
+                            + "\n"
+                        )
+                except Exception:
+                    pass
+                # endregion
+                if est_shares < 5.0:
+                    print(
+                        f"⚠️ [Polymarket] Even after price adjust, estimated shares {est_shares:.2f} < 5 for maker BUY on token {token_id} "
+                        f"(amount={raw_amount:.2f}, price={limit_price:.3f}); skipping."
+                    )
+                    # region agent log
+                    try:
+                        import json as _json
+                        with open("/home/kim/agents/.cursor/debug-ed1d60.log", "a", encoding="utf-8") as _fdbg:
+                            _fdbg.write(
+                                _json.dumps(
+                                    {
+                                        "sessionId": "ed1d60",
+                                        "runId": "pre-fix",
+                                        "hypothesisId": "H5",
+                                        "location": "polymarket.py:execute_market_order",
+                                        "message": "maker_est_shares_too_low",
+                                        "data": {
+                                            "token_id": token_id,
+                                            "raw_amount": float(raw_amount),
+                                            "limit_price": float(limit_price),
+                                            "est_shares": float(est_shares),
+                                        },
+                                        "timestamp": int(time.time() * 1000),
+                                    }
+                                )
+                                + "\n"
+                            )
+                    except Exception:
+                        pass
+                    # endregion
+                    return None
+
+                try:
+                    order_args = OrderArgs(
+                        token_id=token_id,
+                        price=limit_price,
+                        size=est_shares,
+                        side="BUY",
+                    )
+                    signed = self.client.create_order(order_args)
+                    res = self.client.post_order(signed, OrderType.GTC)
+                    if not res:
+                        print(f"⚠️ [Polymarket] post_order (maker BUY) returned empty response for token {token_id}.")
+                        # region agent log
+                        try:
+                            import json as _json
+                            with open("/home/kim/agents/.cursor/debug-ed1d60.log", "a", encoding="utf-8") as _fdbg:
+                                _fdbg.write(
+                                    _json.dumps(
+                                        {
+                                            "sessionId": "ed1d60",
+                                            "runId": "pre-fix",
+                                            "hypothesisId": "H5",
+                                            "location": "polymarket.py:execute_market_order",
+                                            "message": "maker_post_order_empty",
+                                            "data": {
+                                                "token_id": token_id,
+                                                "limit_price": float(limit_price),
+                                                "est_shares": float(est_shares),
+                                            },
+                                            "timestamp": int(time.time() * 1000),
+                                        }
+                                    )
+                                    + "\n"
+                                )
+                        except Exception:
+                            pass
+                        # endregion
+                        return None
+                    if isinstance(res, dict) and res.get("error"):
+                        err = res.get("error")
+                        err_str = (err.get("message") if isinstance(err, dict) else str(err)) if err is not None else "Unknown error"
+                        print(f"⚠️ [Polymarket] post_order (maker BUY) error for token {token_id}: {err_str[:160]}")
+                        # region agent log
+                        try:
+                            import json as _json
+                            with open("/home/kim/agents/.cursor/debug-ed1d60.log", "a", encoding="utf-8") as _fdbg:
+                                _fdbg.write(
+                                    _json.dumps(
+                                        {
+                                            "sessionId": "ed1d60",
+                                            "runId": "pre-fix",
+                                            "hypothesisId": "H5",
+                                            "location": "polymarket.py:execute_market_order",
+                                            "message": "maker_post_order_error",
+                                            "data": {
+                                                "token_id": token_id,
+                                                "error": err_str[:200],
+                                            },
+                                            "timestamp": int(time.time() * 1000),
+                                        }
+                                    )
+                                    + "\n"
+                                )
+                        except Exception:
+                            pass
+                        # endregion
+                        return None
+                    order_id = None
+                    if isinstance(res, dict):
+                        order_id = res.get("orderId") or res.get("order_id") or res.get("id")
+                    if not order_id:
+                        print(f"⚠️ [Polymarket] post_order (maker BUY) unexpected response for token {token_id}: {(str(res)[:200])!r}")
+                        return None
+                    print(
+                        f"ℹ️ [Polymarket] Placed maker BUY (GTC) for token {token_id} at {limit_price:.3f} "
+                        f"for ~{est_shares:.2f} shares."
+                    )
+                    return order_id
+                except Exception as e:
+                    logger.exception("execute_market_order maker BUY exception for token %s: %s", token_id, str(e)[:200])
+                    return None
         except Exception as e:
-            print(f"⚠️ [Polymarket] execute_market_order exception for token {token_id}: {str(e)[:200]}")
+            logger.exception("execute_market_order exception for token %s: %s", token_id, str(e)[:200])
             return None
 
     def execute_sell_order(self, token_id: str, shares: float, price: float) -> bool:
@@ -441,17 +832,24 @@ class Polymarket:
         Lägger en limit‑SELL order för ett token vid givet pris.
         """
         try:
-            # Hämta tick size/neg_risk automatiskt
-            options = self.client.get_partial_create_order_options(str(token_id))
-            args = MarketOrderArgs(
+            # Limit‑SELL via OrderArgs → GTC‑order som vilar i boken tills matchad.
+            limit_price = float(price)
+            size = float(shares)
+            if limit_price <= 0 or size <= 0:
+                return False
+            order_args = OrderArgs(
                 token_id=str(token_id),
-                amount=float(shares),
+                price=limit_price,
+                size=size,
                 side="SELL",
-                price=float(price),
             )
-            order = self.client.create_order_from_market_order(args, options=options)
-            res = self.client.post_order(order)
-            return bool(res)
+            signed = self.client.create_order(order_args)
+            res = self.client.post_order(signed, OrderType.GTC)
+            if not res:
+                return False
+            if isinstance(res, dict) and res.get("error"):
+                return False
+            return True
         except Exception:
             return False
 

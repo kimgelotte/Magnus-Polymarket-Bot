@@ -1,6 +1,7 @@
 # Magnus V4 – Scanner thread with Bouncer (Option A)
 # Fetches events per strategy, filters, runs Bouncer; only PASS candidates go to queue.
 import json
+import logging
 import time
 import queue
 import asyncio
@@ -8,6 +9,8 @@ import threading
 import datetime as dt
 from typing import Dict, Tuple, Any
 import os
+
+logger = logging.getLogger("magnus.scanner")
 
 # Root path for imports when running from different directories
 import sys
@@ -47,6 +50,8 @@ class MarketScanner(threading.Thread):
         self._stop = threading.Event()
         # Verbos logg (en 🔍‑rad per event) kan slås på med MAGNUS_VERBOSE_SCANNER=1.
         self.verbose = os.getenv("MAGNUS_VERBOSE_SCANNER", "0").strip().lower() in ("1", "true", "yes")
+        # Relaxed mode: släpp igenom fler kandidater till War Room (mjukare krav på likviditet och tid kvar).
+        self.relaxed_filters = os.getenv("MAGNUS_RELAX_SCANNER_FILTERS", "1").strip().lower() in ("1", "true", "yes")
 
     def stop(self):
         self._stop.set()
@@ -147,6 +152,7 @@ class MarketScanner(threading.Thread):
                 self._run_one_round()
             except Exception as e:
                 print(f"\n⚠️ [Scanner] Round error: {e}")
+                logger.exception("Scanner round error")
                 import traceback
                 traceback.print_exc()
             self._prune_dedup()
@@ -199,30 +205,12 @@ class MarketScanner(threading.Thread):
                     if not isinstance(e_category, str):
                         e_category = "Unknown"
 
-                    if "up or down" in e_title.lower():
-                        continue
-                    t_lower = e_title.lower()
-                    if any(
-                        term1 in t_lower and (term2 is None or term2 in t_lower)
-                        for term1, term2 in self.trade.skip_title_patterns
-                    ):
-                        continue
-
                     markets = event.get("markets", [])
                     if not markets:
                         continue
-                    start_str = event.get("startDate")
-                    if start_str:
-                        try:
-                            start_time = dt.datetime.fromisoformat(start_str.replace("Z", "+00:00"))
-                            now = dt.datetime.now(dt.timezone.utc)
-                            is_sport = any(
-                                x in e_title.lower() for x in ["vs", "winner", "o/u", "points", "goals"]
-                            )
-                            if is_sport and now > start_time + dt.timedelta(hours=4):
-                                continue
-                        except Exception:
-                            pass
+                    # Minsta rensning på event‑nivå: skippa enbart rena "up or down"-brusmarknader.
+                    if "up or down" in e_title.lower():
+                        continue
 
                     # Håll loggen ren: standard = ingen per‑event‑rad. Sätt MAGNUS_VERBOSE_SCANNER=1 för att visa.
                     if self.verbose:
@@ -294,10 +282,16 @@ class MarketScanner(threading.Thread):
                                     if self.verbose and skip_price <= 3:
                                         print(f"      [price skip] raw={current_price} (min={min_p}, max={max_p})", flush=True)
                                     continue
-                                # Liquidity filter: thin orderbook → hard to sell without slippage
-                                if bid_liquidity < self.trade.min_bid_liquidity_usdc:
-                                    skip_liquidity += 1
-                                    continue
+                                # Liquidity filter: thin orderbook → hard to sell without slippage.
+                                # I relaxed-läge: tillåt allt med någon budlikviditet (> 0); annars använd konfigurerad gräns.
+                                if self.relaxed_filters:
+                                    if bid_liquidity <= 0:
+                                        skip_liquidity += 1
+                                        continue
+                                else:
+                                    if bid_liquidity < self.trade.min_bid_liquidity_usdc:
+                                        skip_liquidity += 1
+                                        continue
                                 # Spread: Quant REJECT:ar nästan alltid vid >15–25%; filtrera tidigt så vi sparar War Room-anrop
                                 max_spread = getattr(self.trade, "max_spread_pct", 95.0)
                                 if spread_pct is not None and spread_pct > max_spread:
@@ -321,13 +315,38 @@ class MarketScanner(threading.Thread):
                                     min_days = 1.2
                                 elif e_category in self.trade.high_risk_categories:
                                     min_days = 1.0
-                                if days_until_end is not None and days_until_end < min_days:
-                                    skip_days += 1
-                                    continue
+                                # I relaxed-läge: släpp igenom fler – minst ~0.08 dagar (~2h); annars 0.2 dagar.
+                                if days_until_end is not None:
+                                    if self.relaxed_filters:
+                                        min_days_relaxed = 0.08
+                                        try:
+                                            min_days_relaxed = float(os.getenv("MAGNUS_SCANNER_MIN_DAYS_RELAXED", "0.08"))
+                                        except ValueError:
+                                            pass
+                                        if days_until_end < min_days_relaxed:
+                                            skip_days += 1
+                                            continue
+                                    else:
+                                        if days_until_end < min_days:
+                                            skip_days += 1
+                                            continue
                                 range_pct = price_context.get("range_pct") or 0
                                 if range_pct < self.trade.min_range_pct:
                                     skip_range += 1
                                     continue
+                                # Price‑zon: konfigurerbar; av med MAGNUS_SCANNER_REF_PRICE_FILTER=0 för max antal kandidater.
+                                ref_price_filter_on = os.getenv("MAGNUS_SCANNER_REF_PRICE_FILTER", "1").strip().lower() in ("1", "true", "yes")
+                                if ref_price_filter_on:
+                                    avg_price = float(stats.get("avg") or 0.0)
+                                    ref_price = avg_price if avg_price > 0 else current_price
+                                    try:
+                                        min_ref = float(os.getenv("MAGNUS_SCANNER_MIN_PRICE", "0.01"))
+                                        max_ref = float(os.getenv("MAGNUS_SCANNER_MAX_PRICE", "0.99"))
+                                    except ValueError:
+                                        min_ref, max_ref = 0.01, 0.99
+                                    if not (min_ref <= ref_price <= max_ref):
+                                        skip_price += 1
+                                        continue
                                 if self.trade.min_change_1h_pct > 0:
                                     change_1h = price_context.get("change_1h")
                                     if change_1h is None or abs(float(change_1h)) < self.trade.min_change_1h_pct:
@@ -423,6 +442,42 @@ class MarketScanner(threading.Thread):
             if skip_spread: parts.append(f"spread={skip_spread}")
             if skip_dup: parts.append(f"dup={skip_dup}")
             if skip_queue_full: parts.append(f"full={skip_queue_full}")
+
+            # region agent log
+            try:
+                import json as _json  # lokal alias för debug-loggning
+                with open("/home/kim/agents/.cursor/debug-ed1d60.log", "a", encoding="utf-8") as _fdbg:
+                    _fdbg.write(
+                        _json.dumps(
+                            {
+                                "sessionId": "ed1d60",
+                                "runId": "pre-fix",
+                                "hypothesisId": "H1",
+                                "location": "scanner.py:_run_one_round",
+                                "message": "scanner_round_summary",
+                                "data": {
+                                    "strategy": strategy,
+                                    "n_events": n_events,
+                                    "to_bouncer": to_bouncer,
+                                    "enqueued": enqueued_this_round,
+                                    "skip_scan": skip_scan,
+                                    "skip_price": skip_price,
+                                    "skip_liquidity": skip_liquidity,
+                                    "skip_days": skip_days,
+                                    "skip_range": skip_range,
+                                    "skip_spread": skip_spread,
+                                    "skip_dup": skip_dup,
+                                    "skip_queue_full": skip_queue_full,
+                                },
+                                "timestamp": int(time.time() * 1000),
+                            }
+                        )
+                        + "\n"
+                    )
+            except Exception:
+                pass
+            # endregion
+
             _f = lambda s: print(s, flush=True)
             _f("\n" + "─" * 60)
             _f("📡 SCANNER – resultat (" + strategy + ")")

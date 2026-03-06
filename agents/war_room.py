@@ -49,7 +49,8 @@ class MagnusWarRoom:
 
     def __init__(self):
         load_dotenv()
-        self.skip_lawyer = os.getenv("MAGNUS_SKIP_LAWYER", "").strip().lower() in ("1", "true", "yes")
+        # Default 1: skippa Lawyer så fler når Scout/Quant; sätt 0 för att köra Lawyer (stramare regler).
+        self.skip_lawyer = os.getenv("MAGNUS_SKIP_LAWYER", "1").strip().lower() in ("1", "true", "yes")
         self.xai_key = os.getenv("XAI_API_KEY")
         self.ds_key = os.getenv("DEEPSEEK_API_KEY")
         self.claude_key = os.getenv("ANTHROPIC_API_KEY")
@@ -532,7 +533,10 @@ class MagnusWarRoom:
         url = "https://api.deepseek.com/chat/completions"
         headers = {"Authorization": f"Bearer {self.ds_key}", "Content-Type": "application/json"}
         specific_logic = self.LOGIC_ENGINE.get(category, self.LOGIC_ENGINE["Unknown"])
-        spread_cap = 12 if uncertain_market else 15  # något generösare – Quant väger in edge
+        # Lätta på agenten: högre spread_cap så vi REJECT:ar färre pga spread; Quant väger in edge.
+        spread_cap = 20 if uncertain_market else 25
+        if category in ("Crypto", "Geopolitics", "Elections"):
+            spread_cap = 28 if uncertain_market else 35
 
         prompt = (
             f"Our goal: {self.SHARED_GOAL} "
@@ -540,17 +544,22 @@ class MagnusWarRoom:
             "You are the only one who outputs BUY or REJECT; you must use PRICE CONTEXT for timing.\n\n"
             "CORE PRINCIPLE: We want to buy CHEAP and sell DEAR. That means: buy CHEAPER THAN IT IS WORTH (current price lower than our assessed value), and sell at a higher price = profit. "
             "We sell before resolution; we do not need to believe the outcome will be true – only that the price can go up. "
-            "BUY when the current price is meaningfully below what you judge the outcome to be worth (your MAX_PRICE) and there is a realistic path for price to move up. When in doubt: set MAX_PRICE LOWER rather than REJECT; only REJECT when there is clearly no edge or no time. We prefer to BUY when there is any plausible edge – REJECT only when there is clearly no way to sell at a profit (e.g. no catalyst, no time, or price already at ceiling).\n\n"
+            "BUY when the current price is meaningfully below what you judge the outcome to be worth (your MAX_PRICE) and there is a realistic path for price to move up. When in doubt: BUY with a conservative MAX_PRICE – do NOT REJECT unless you are confident there is no edge (no catalyst, no time, or price already at ceiling with no upside). We prefer to let trades through; only REJECT when there is clearly no way to sell at a profit.\n\n"
             "NON-NEGOTIABLE: We must sell at a profit (price strictly above our entry). Only BUY if there is a realistic path to selling at a price above entry before resolution. "
             "MAX_PRICE must be a SELLABLE level we can plausibly reach (what buyers might pay), not a theoretical fair value we may never see. "
             "If the only way to 'win' would be to hold to resolution, REJECT – we exit before resolution and must realise profit in the secondary market.\n\n"
-            "STRATEGY: We only look at volatile markets (this one has sufficient historical range). Use STATS and PRICE CONTEXT (high, low, avg, where price sits in the range) to spot PATTERNS: BUY when price is relatively LOW in the range so we can sell when it has moved up; REJECT if price is already HIGH in the range with little upside left.\n\n"
+            "STRATEGY: We only look at volatile markets (this one has sufficient historical range). Use STATS and PRICE CONTEXT (high, low, avg, where price sits in the range) to spot PATTERNS: BUY when price is relatively LOW in the range so we can sell when it has moved up; REJECT if price is clearly at the very top of the range with no realistic upside and no catalyst.\n\n"
             f"CATEGORY: {category}\n"
             f"LOGIC TO FOLLOW: {specific_logic}\n"
             "Use historical range and where the current price sits (vs low/avg/high): prefer BUY when price is in the lower part of the range or when there is a plausible catalyst; only REJECT when price is clearly at the top of the range with no upside and no catalyst.\n\n"
         )
         if uncertain_market:
-            prompt += "Uncertain market: require clear edge and low spread. For Geopolitics, Crypto and Earnings: require especially clear edge in an uncertain market.\n"
+            prompt += "Uncertain market: require clear edge and reasonable spread. For Geopolitics, Crypto and Earnings: require especially clear edge in an uncertain market, but do NOT auto-reject just because price is near recent highs if catalyst/momentum clearly support further upside.\n"
+        # Viktigt för Magnus: pris nära taket = varningsflagg, inte auto-REJECT.
+        prompt += (
+            "IMPORTANT: Do NOT automatically REJECT just because the current price is near the historical high. "
+            "If there is strong catalyst, momentum or news (especially in Crypto and Geopolitics) and a realistic path for the price to move further up before resolution, it can still be a BUY – just set MAX_PRICE to a conservative, sellable level that buyers might actually pay.\n\n"
+        )
         prompt += (
             f"QUESTION: {question}\n"
             f"PRICE NOW: {price} (decimal 0–1, e.g. 0.55 = 55¢)\n"
@@ -566,7 +575,7 @@ class MagnusWarRoom:
             prompt += f"PRICE CONTEXT: {self._format_price_context(price_context, price)}\n"
         if spread_pct is not None:
             b, a = bid or 0, ask or 0
-            prompt += f"SPREAD: {spread_pct}% (bid={b:.3f} ask={a:.3f}). With high spread it is harder to sell at a good price later; illiquid market carries risk. REJECT if spread > {spread_cap}% unless you see a very clear edge.\n"
+            prompt += f"SPREAD: {spread_pct}% (bid={b:.3f} ask={a:.3f}). High spread makes exit harder; only REJECT for spread if spread > {spread_cap}% AND you see no clear edge – otherwise BUY with conservative MAX_PRICE is OK.\n"
         prompt += f"SCOUT OUTPUT FROM GROK: {hype_data['summary']}\n"
         if event_markets_context and event_markets_context.strip():
             prompt += (
@@ -578,8 +587,8 @@ class MagnusWarRoom:
         if similar_analyses and similar_analyses.strip():
             prompt += f"\nSIMILAR PAST ANALYSES (use as reference, not as requirement):\n{similar_analyses.strip()}\n\n"
         prompt += (
-            f"RULES: BUY only if (1) current price is CHEAPER THAN IT IS WORTH (current price < your MAX_PRICE with margin), AND (2) realistic path to selling at a profit (price moves up), AND (3) enough time left, AND (4) the rules are clear enough for the market to be tradable and to resolve (avoid vague/manipulated markets), AND (5) spread is acceptable (if spread > {spread_cap}% a clear edge is required; otherwise REJECT), AND (6) MAX_PRICE is a sellable level we can plausibly reach – not a hope value. "
-            "REJECT if the price is not cheap, no realistic path to net profit, too little time, the market is untradable or manipulated, or spread too high without clear edge.\n"
+            f"RULES: BUY if (1) current price is CHEAPER THAN IT IS WORTH (current price < your MAX_PRICE with margin), AND (2) realistic path to selling at a profit, AND (3) enough time left, AND (4) rules are clear enough to resolve, AND (5) spread OK or you see clear edge (REJECT only if spread > {spread_cap}% AND no edge), AND (6) MAX_PRICE is a sellable level we can plausibly reach. "
+            "REJECT only when clearly no edge: price not cheap, no path to profit, too little time, or untradable/manipulated market. When borderline: prefer BUY with conservative MAX_PRICE.\n"
             "MAX_PRICE must be a decimal between 0.01 and 0.99 (not percent).\n"
             "Reply exactly:\nACTION: [BUY or REJECT]\nMAX_PRICE: [number 0.01–0.99]\nREASON: [One short sentence only]"
         )
