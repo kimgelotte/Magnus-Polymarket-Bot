@@ -197,7 +197,7 @@ class MarketScanner(threading.Thread):
             for count, event in enumerate(events, 1):
                 if self._stop.is_set():
                     return
-                if count == n_events or (n_events <= 50 and count % 5 == 0) or (n_events > 50 and count % 20 == 0):
+                if count == n_events or (n_events <= 50 and count % 5 == 0) or (n_events > 50 and count % 100 == 0):
                     print(f"   [Scanner] {count}/{n_events} events…", flush=True)
                 try:
                     e_title = event.get("title", "Untitled")
@@ -483,7 +483,8 @@ class MarketScanner(threading.Thread):
             _f("📡 SCANNER – resultat (" + strategy + ")")
             _f("   Hittade: " + str(n_events) + " events, " + str(to_bouncer) + " token(s) passerade pre-filter.")
             if enqueued_this_round > 0:
-                _f("   → Till analys (kön): " + str(enqueued_this_round) + " kandidat(er).")
+                qsize = self.candidate_queue.qsize()
+                _f("   → Till analys (kön): " + str(enqueued_this_round) + " kandidat(er). War Room plockar nästa batch (kön har nu " + str(qsize) + ").")
             else:
                 why = []
                 if skip_dup: why.append("dup")

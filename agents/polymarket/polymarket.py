@@ -18,10 +18,59 @@ from py_clob_client.clob_types import (
     BookParams,
     OrderType,
     OrderArgs,
+    PartialCreateOrderOptions,
 )
 
 
 load_dotenv()
+
+# Verifiering: logga exakt vad som skickas till CLOB när MAGNUS_VERIFY_CLOB_PAYLOAD=1
+_VERIFY_LOG_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "verify-clob-payload.jsonl")
+
+
+def _capture_and_log_clob_post(endpoint: str, headers, data):
+    """Loggar CLOB POST för verifiering – anropas vid /order-anrop."""
+    import json as _json
+    try:
+        h = dict(headers) if headers else {}
+        poly_addr = h.get("POLY_ADDRESS", "?")
+        body_str = data if isinstance(data, str) else _json.dumps(data) if data else ""
+        maker = signer = sig_type = "?"
+        try:
+            parsed = _json.loads(body_str) if body_str else {}
+            o = parsed.get("order") or {}
+            maker = o.get("maker", "?")
+            signer = o.get("signer", "?")
+            sig_type = o.get("signatureType", "?")
+        except Exception:
+            pass
+        msg = f"[CLOB VERIFY] POLY_ADDRESS={poly_addr} | maker={maker} | signer={signer} | signatureType={sig_type}"
+        print(msg)
+        logger.info("CLOB payload: %s", msg)
+        try:
+            with open(_VERIFY_LOG_PATH, "a", encoding="utf-8") as f:
+                f.write(_json.dumps({"ts": time.time(), "endpoint": endpoint, "POLY_ADDRESS": poly_addr, "maker": maker, "signer": signer, "signatureType": sig_type}, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+def _install_clob_verify_patch() -> None:
+    """Patchar CLOB POST så vi loggar /order-anrop – client importerar post, så vi patchar client-modulen."""
+    from py_clob_client import client as _client_mod
+    _orig_post = _client_mod.post
+
+    def _logged_post(endpoint: str, headers=None, data=None):
+        if "/order" in endpoint:
+            _capture_and_log_clob_post(endpoint, headers, data)
+        return _orig_post(endpoint, headers, data)
+
+    _client_mod.post = _logged_post
+
+
+# Kör efter ClobClient-import
+_install_clob_verify_patch()
 
 
 class Polymarket:
@@ -37,16 +86,69 @@ class Polymarket:
 
     CLOB_HOST = "https://clob.polymarket.com"
     GAMMA_EVENTS_ENDPOINT = "https://gamma-api.polymarket.com/events"
+    GAMMA_PUBLIC_PROFILE_URL = "https://gamma-api.polymarket.com/public-profile"
     # On‑chain USDC.e (Polymarket collateral) på Polygon
     USDC_E_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+
+    @staticmethod
+    def get_proxy_funder_from_api(wallet_address: str) -> Optional[str]:
+        """
+        Hämtar proxy/funder-adress för en wallet via Gamma API (public-profile).
+        Använd EOA-adressen (t.ex. från PRIVATE_KEY); svaret innehåller proxyWallet som är
+        den adress Polymarket använder för deposit/saldo (samma som på polymarket.com/settings).
+        Returnerar None om profilen saknas eller inte har proxyWallet.
+        """
+        if not wallet_address or not str(wallet_address).strip().startswith("0x"):
+            return None
+        addr = str(wallet_address).strip()
+        try:
+            r = httpx.get(
+                Polymarket.GAMMA_PUBLIC_PROFILE_URL,
+                params={"address": addr},
+                timeout=10.0,
+            )
+            if r.status_code != 200:
+                return None
+            data = r.json()
+            proxy = data.get("proxyWallet") or data.get("proxy_wallet")
+            if proxy and isinstance(proxy, str) and proxy.strip().startswith("0x"):
+                return proxy.strip()
+            return None
+        except Exception:
+            return None
 
     def __init__(self) -> None:
         private_key = os.getenv("PRIVATE_KEY", "").strip()
         if not private_key:
             raise RuntimeError("PRIVATE_KEY saknas i .env – kan inte initiera Polymarket‑klient.")
 
-        signature_type = int(os.getenv("POLYGON_SIGNATURE_TYPE", "1"))
+        # Default 2 = GNOSIS_SAFE (MetaMask + deposit) – vanligast; 0 = ren EOA.
+        signature_type = int(os.getenv("POLYGON_SIGNATURE_TYPE", "2"))
         funder_address = os.getenv("POLYMARKET_FUNDER_ADDRESS", "").strip() or None
+
+        # EOA (type 0): maker = signer = adress från PRIVATE_KEY. Proxy (type 1/2): maker = funder (proxy), signer = EOA.
+        # Ordern signeras alltid med PRIVATE_KEY (EOA); SDK sätter maker=funder, signer=EOA, signatureType i OrderData.
+        # Det krävs INGEN extra signatur: en EIP-712-order signeras av EOA; signatureType 2 säger bara att maker är en Safe.
+        if signature_type == 0:
+            from eth_account import Account
+            funder_address = Account.from_key(private_key).address
+        elif signature_type in (1, 2):
+            if not (funder_address and funder_address.startswith("0x")):
+                # Försök hämta proxy (funder) från Gamma API – samma som visad på polymarket.com/settings.
+                from eth_account import Account
+                eoa = Account.from_key(private_key).address
+                funder_address = Polymarket.get_proxy_funder_from_api(eoa)
+                if funder_address:
+                    try:
+                        print(f"[Polymarket] Proxy (funder) hämtad från API: {funder_address[:10]}…{funder_address[-6:]}")
+                    except Exception:
+                        pass
+                if not (funder_address and funder_address.startswith("0x")):
+                    raise RuntimeError(
+                        "POLYMARKET_FUNDER_ADDRESS krävs för signature type 1/2 (proxy), eller så hittades ingen "
+                        "proxy för din EOA i Polymarket. Logga in på polymarket.com och gör en deposit så skapas "
+                        "proxy; sätt sedan POLYMARKET_FUNDER_ADDRESS (finns på polymarket.com/settings)."
+                    )
 
         self.client = ClobClient(
             self.CLOB_HOST,
@@ -56,19 +158,53 @@ class Polymarket:
             funder=funder_address,
         )
 
+        # För proxy (type 1/2): balance-endpoint kräver POLY_ADDRESS=funder; post_order kräver POLY_ADDRESS=signer
+        # (API-nyckeln är bunden till signer/EOA – docs: "POLY_ADDRESS = Polygon signer address").
+        # Vi patchar endast under get_usdc_balance; post_order använder default (signer).
+        self._l2_funder_for_balance = (funder_address if signature_type in (1, 2) and funder_address else None)
+
         # L2‑autentisering mot CLOB:
-        # 1) Om USER_API_* finns i .env – använd dem direkt (ingen L1‑derivering behövs).
-        # 2) Annars: skapa/derivera API‑creds från PRIVATE_KEY (standardvägen).
+        # 1) Om POLYMARKET_FORCE_NEW_API_KEY=1 – skapa ny API‑nyckel med nonce från chain (test mot invalid signature).
+        # 2) Om USER_API_* finns i .env – använd dem direkt.
+        # 3) Annars: skapa/derivera API‑creds från PRIVATE_KEY (standardvägen).
         self.api_creds: Optional[ApiCreds] = None
 
+        force_new = os.getenv("POLYMARKET_FORCE_NEW_API_KEY", "").strip() in ("1", "true", "yes")
         user_key = os.getenv("USER_API_KEY", "").strip()
         user_secret = os.getenv("USER_API_SECRET", "").strip()
         user_pass = os.getenv("USER_API_PASSPHRASE", "").strip()
 
         try:
-            if user_key and user_secret and user_pass:
-                # Manuell User‑API – t.ex. om L1‑endpoints strular.
-                # ApiCreds-fält enligt py_clob_client: api_key, api_secret, api_passphrase.
+            if force_new:
+                # Ny nonce från chain → create_api_key ger färska credentials (GitHub #79).
+                from eth_account import Account
+                eoa = Account.from_key(private_key).address
+                rpc = os.getenv("POLYGON_CONFIG_MAINNET_RPC_URL", "").strip()
+                nonce = 0
+                if rpc:
+                    try:
+                        payload = {
+                            "jsonrpc": "2.0", "id": 1, "method": "eth_getTransactionCount",
+                            "params": [eoa, "latest"],
+                        }
+                        r = httpx.post(rpc, json=payload, timeout=10.0)
+                        res = r.json().get("result")
+                        if isinstance(res, str) and res.startswith("0x"):
+                            nonce = int(res, 16)
+                    except Exception:
+                        pass
+                creds = self.client.create_api_key(nonce)
+                if isinstance(creds, ApiCreds):
+                    self.client.set_api_creds(creds)
+                    self.api_creds = creds
+                    print(
+                        f"[Polymarket] NY API‑nyckel skapad (nonce={nonce}). Kopiera till .env:\n"
+                        f"  USER_API_KEY={getattr(creds, 'api_key', '')}\n"
+                        f"  USER_API_SECRET={getattr(creds, 'api_secret', '')}\n"
+                        f"  USER_API_PASSPHRASE={getattr(creds, 'api_passphrase', '')}\n"
+                        f"Ta bort POLYMARKET_FORCE_NEW_API_KEY efter att du sparat nycklarna."
+                    )
+            elif user_key and user_secret and user_pass:
                 manual = ApiCreds(api_key=user_key, api_secret=user_secret, api_passphrase=user_pass)
                 self.client.set_api_creds(manual)
                 self.api_creds = manual
@@ -88,8 +224,6 @@ class Polymarket:
                     except Exception:
                         pass
         except Exception:
-            # Om detta misslyckas kan vi fortfarande läsa market‑data,
-            # men orderläggning och balansfrågor kan ge PolyException senare.
             pass
 
         # Kortlivad cache för price/book/history (minskar CLOB-anrop inom samma runda).
@@ -100,6 +234,95 @@ class Polymarket:
         self._cache_lock = threading.Lock()
         # Vid get_balance_allowance-fel använd senast lyckade saldo så vi inte visar 0 och pausar onödigt.
         self._last_balance: Optional[float] = None
+
+        # CLOB heartbeat: utan heartbeat inom ~10s avbryts alla öppna ordrar (Polymarket docs).
+        self._heartbeat_stop = threading.Event()
+        self._heartbeat_thread: Optional[threading.Thread] = None
+
+    def _heartbeat_loop(self) -> None:
+        """Bakgrundstråd: skickar heartbeat var 5:e sekund så GTC-ordrar inte avbryts.
+        Vid 400 Invalid Heartbeat ID: servern returnerar rätt ID – extrahera och retry. Annars reset till ""."""
+        heartbeat_id = ""
+        ok_count = 0
+        last_400_id: Optional[str] = None
+        while not self._heartbeat_stop.wait(timeout=5.0):
+            try:
+                resp = self.client.post_heartbeat(heartbeat_id)
+                if isinstance(resp, dict):
+                    new_id = resp.get("heartbeat_id")
+                    if new_id is not None:
+                        heartbeat_id = str(new_id)
+                    ok_count += 1
+                    if ok_count > 0 and ok_count % 12 == 0:
+                        logger.debug("CLOB heartbeat OK (%d)", ok_count)
+            except Exception as e:
+                # Polymarket docs: vid 400 "Invalid Heartbeat ID" – använd rätt ID från svar eller starta om med ""
+                try:
+                    from py_clob_client.exceptions import PolyApiException
+                    if isinstance(e, PolyApiException):
+                        if getattr(e, "status_code", None) == 400:
+                            err = getattr(e, "error_msg", None)
+                            if isinstance(err, dict) and "Invalid Heartbeat ID" in str(err.get("error", "")):
+                                correct_id = err.get("heartbeat_id")
+                                if correct_id and correct_id != last_400_id:
+                                    heartbeat_id = str(correct_id)
+                                    last_400_id = correct_id
+                                    logger.info("Heartbeat: använder ID från 400-svar.")
+                                else:
+                                    heartbeat_id = ""
+                                    last_400_id = None
+                                    logger.info("Heartbeat: startar om med tom ID.")
+                                continue
+                        # status_code=None = nätverksfel (Request exception!) – behåll ID, retry nästa runda
+                        if getattr(e, "status_code", None) is None:
+                            logger.debug("Heartbeat: tillfälligt nätverksfel, retry om 5s.")
+                            continue
+                except Exception:
+                    pass
+                logger.warning("CLOB heartbeat misslyckades: %s", e)
+                ok_count = 0
+                heartbeat_id = ""
+                last_400_id = None
+
+    def start_heartbeat(self) -> None:
+        """Startar heartbeat-tråd – krävs för att GTC-ordrar ska ligga kvar på boken."""
+        if self._heartbeat_thread is not None and self._heartbeat_thread.is_alive():
+            return
+        self._heartbeat_stop.clear()
+        self._heartbeat_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
+        self._heartbeat_thread.start()
+        logger.info("CLOB heartbeat startad – GTC-ordrar hålls levande.")
+        print("[Polymarket] Heartbeat aktiv – öppna ordrar hålls kvar på boken.")
+
+    def stop_heartbeat(self) -> None:
+        """Stoppar heartbeat-tråden."""
+        self._heartbeat_stop.set()
+        if self._heartbeat_thread is not None:
+            self._heartbeat_thread.join(timeout=6.0)
+            self._heartbeat_thread = None
+
+    def get_open_orders(self, asset_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Hämtar öppna ordrar från CLOB. asset_id = token_id för att filtrera.
+        För proxy (type 2) patchar vi POLY_ADDRESS till funder så vi får ordrar för rätt konto (samma som polymarket.com visar)."""
+        try:
+            from py_clob_client.clob_types import OpenOrderParams
+            from py_clob_client.headers import headers as _l2_headers
+            params = OpenOrderParams(asset_id=asset_id) if asset_id else None
+            orig_l2 = _l2_headers.create_level_2_headers
+            if self._l2_funder_for_balance:
+                def _l2_with_funder(signer, creds, request_args):
+                    h = orig_l2(signer, creds, request_args)
+                    h[_l2_headers.POLY_ADDRESS] = self._l2_funder_for_balance
+                    return h
+                _l2_headers.create_level_2_headers = _l2_with_funder
+            try:
+                return self.client.get_orders(params) or []
+            finally:
+                if self._l2_funder_for_balance:
+                    _l2_headers.create_level_2_headers = orig_l2
+        except Exception as e:
+            logger.warning("get_open_orders failed: %s", e)
+            return []
 
     def _get_cached(self, cache: Dict[str, Tuple[Any, float]], key: str) -> Any:
         with self._cache_lock:
@@ -137,9 +360,11 @@ class Polymarket:
         Hämtar aktiva events via Gamma API.
 
         strategy:
-          - 'trending'  → order=volume_24hr
-          - 'featured'  → featured=true (om tillgängligt)
-          - 'new'       → order=id (nyaste först)
+          - 'trending'     → order=volume_24hr (redan populära – ofta pumpade)
+          - 'featured'     → featured=true (curated)
+          - 'new'          → order=id (nyaste först)
+          - 'liquid'       → order=liquidity (mest likviditet – lättare att köpa, mindre slippage)
+          - 'undiscovered' → order=volume_24hr ascending (lägst volym – mindre upptäckta, kan ha edge)
         """
         # Gamma tillåter större batch – 250 ger fler events per anrop (särskilt för trending/new)
         params: Dict[str, Any] = {
@@ -157,6 +382,12 @@ class Polymarket:
         elif s == "new":
             params["order"] = "id"
             params["ascending"] = "false"
+        elif s == "liquid":
+            params["order"] = "liquidity"
+            params["ascending"] = "false"
+        elif s == "undiscovered":
+            params["order"] = "volume_24hr"
+            params["ascending"] = "true"
 
         events: List[Dict[str, Any]] = []
         offset = 0
@@ -338,25 +569,37 @@ class Polymarket:
         """
         Returnerar USDC‑saldo via CLOB balance/allowance‑endpoint.
         Kräver L2‑auth; vid fel returneras 0.
+        För proxy (type 1/2) patchar vi POLY_ADDRESS till funder endast här så post_order använder signer.
         """
+        from py_clob_client.headers import headers as _l2_headers
+        orig_l2 = _l2_headers.create_level_2_headers
+        if self._l2_funder_for_balance:
+            def _l2_with_funder(signer, creds, request_args):
+                h = orig_l2(signer, creds, request_args)
+                h[_l2_headers.POLY_ADDRESS] = self._l2_funder_for_balance
+                return h
+            _l2_headers.create_level_2_headers = _l2_with_funder
         try:
-            # Viktigt: signature_type måste matcha vår wallet‑typ (0=EOA, 1=magic/email, 2=proxy),
-            # annars returnerar CLOB 0 även om saldo finns.
-            sig_type = int(os.getenv("POLYGON_SIGNATURE_TYPE", "1"))
+            sig_type = int(os.getenv("POLYGON_SIGNATURE_TYPE", "2"))
             params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL, signature_type=sig_type)
             data = self.client.get_balance_allowance(params)
         except Exception as e:
-            # Vid fel: använd cache om vi har; logga bara när vi saknar cache (returnerar 0) så brus minskar.
             if self._last_balance is not None:
                 return float(self._last_balance)
             logger.warning("get_balance_allowance error (no cache): %s", e)
             return 0.0
+        finally:
+            if self._l2_funder_for_balance:
+                _l2_headers.create_level_2_headers = orig_l2
 
         if isinstance(data, dict):
             onchain, addr = self._get_onchain_usdce_balance()
             bal = data.get("balance") or data.get("collateral") or 0
             try:
-                clob_balance = float(bal)
+                # CLOB returnerar USDC‑saldo i "wei" (base units, 10^6).
+                # Konvertera till riktiga USDC.e‑enheter så allt internt är i samma skala.
+                clob_raw = float(bal)
+                clob_balance = clob_raw / 1_000_000.0
                 # Fallback: om CLOB rapporterar 0 men det finns on‑chain USDC.e på funder‑adressen,
                 # använd det on‑chain‑saldot som "Balance" internt så Magnus kan fortsätta arbeta.
                 if clob_balance == 0.0 and onchain is not None and onchain > 0:
@@ -441,14 +684,52 @@ class Polymarket:
                 continue
         return total, best_ask
 
+    # Giltiga tick sizes enligt https://docs.polymarket.com/trading/orders/create (Order Options)
+    _VALID_TICK_SIZES = ("0.1", "0.01", "0.001", "0.0001")
+
+    def _get_order_options(self, token_id: str, condition_id: Optional[str] = None) -> PartialCreateOrderOptions:
+        """
+        Hämtar tick_size och neg_risk för ordrar (enligt docs: options krävs för create_order/create_market_order).
+        Försöker get_market(condition_id) om condition_id finns, annars get_tick_size/get_neg_risk per token_id.
+        tick_size normaliseras till ett av API:ets tillåtna värden (0.1, 0.01, 0.001, 0.0001).
+        """
+        def _norm_tick(s: str) -> str:
+            if s in self._VALID_TICK_SIZES:
+                return s
+            try:
+                f = float(s)
+                for v in ("0.0001", "0.001", "0.01", "0.1"):
+                    if f >= float(v):
+                        return v
+            except (TypeError, ValueError):
+                pass
+            return "0.01"
+
+        try:
+            if condition_id:
+                market = self.client.get_market(condition_id)
+                if isinstance(market, dict):
+                    raw = market.get("minimum_tick_size", "0.01")
+                    tick_size = _norm_tick(str(raw))
+                    neg_risk = bool(market.get("neg_risk", False))
+                    return PartialCreateOrderOptions(tick_size=tick_size, neg_risk=neg_risk)
+        except Exception:
+            pass
+        tick_size = self.client.get_tick_size(token_id)
+        neg_risk = self.client.get_neg_risk(token_id)
+        ts = str(tick_size) if tick_size else "0.01"
+        return PartialCreateOrderOptions(tick_size=_norm_tick(ts), neg_risk=bool(neg_risk))
+
     def execute_market_order(self, market_to_buy, amount_usdc: float, max_price: Optional[float] = None) -> Optional[str]:
         """
         Lägger en market‑BUY order i USDC på active_token_id.
         Returnerar orderId vid OK, annars None.
 
-        Viktigt: om något går fel loggar vi orsaken så att Magnus‑loggarna
-        visar *varför* ett köp inte gick igenom (t.ex. insufficient balance,
-        auth‑fel eller CLOB‑validering).
+        API: https://docs.polymarket.com/trading/orders/create
+        - När det finns ask‑likviditet: FOK BUY via create_market_order(amount=USDC, price=worst‑price) + post_order(..., OrderType.FOK).
+        - När det saknas ask: limit BUY via create_order(OrderArgs(price, size=shares)) + post_order(..., OrderType.GTC).
+        Options (tick_size, neg_risk) hämtas per marknad och skickas till create_order/create_market_order.
+        Signering: SDK bygger OrderData (maker=funder, signer=EOA) och signerar med PRIVATE_KEY.
         """
         token_id = str(getattr(market_to_buy, "active_token_id"))
         try:
@@ -550,14 +831,33 @@ class Polymarket:
                         )
                         return None
 
+                # Enligt https://docs.polymarket.com/trading/orders/create: market BUY = amount (USDC), price = worst-price limit (slippage).
+                # post_order måste få OrderType.FOK för FOK-orders. Skicka tick_size + neg_risk i options.
+                worst_price = float(max_price) if max_price is not None and max_price > 0 else (float(best_ask) if best_ask and best_ask > 0 else 0.99)
                 args = MarketOrderArgs(
                     token_id=token_id,
                     amount=effective_amount,
                     side="BUY",
                     order_type=OrderType.FOK,
+                    price=worst_price,
                 )
-                order = self.client.create_market_order(args)
-                res = self.client.post_order(order)
+                options = self._get_order_options(token_id, getattr(market_to_buy, "conditionId", None))
+                fok_last_err: Optional[Exception] = None
+                for _attempt in range(3):
+                    try:
+                        order = self.client.create_market_order(args, options)
+                        res = self.client.post_order(order, OrderType.FOK)
+                        break
+                    except Exception as e:
+                        fok_last_err = e
+                        _err_str = str(e)
+                        if _attempt < 2 and ("Request exception" in _err_str or "Server disconnected" in _err_str or "RemoteProtocolError" in _err_str):
+                            time.sleep(2.0 + _attempt)
+                            continue
+                        raise
+                else:
+                    if fok_last_err is not None:
+                        raise fok_last_err
                 if not res:
                     print(f"⚠️ [Polymarket] post_order returned empty response for token {token_id} (amount {effective_amount}).")
                     # region agent log
@@ -585,6 +885,8 @@ class Polymarket:
                 if isinstance(res, dict) and res.get("error"):
                     err = res.get("error")
                     err_str = (err.get("message") if isinstance(err, dict) else str(err)) if err is not None else "Unknown error"
+                    if "FOK" in err_str.upper() or "NOT_FILLED" in err_str.upper():
+                        print(f"⚠️ [Polymarket] FOK misslyckad – ingen likviditet till vårt maxpris. Best ask för högt?")
                     print(f"⚠️ [Polymarket] post_order error for token {token_id}: {err_str[:160]}")
                     # region agent log
                     try:
@@ -610,7 +912,8 @@ class Polymarket:
                     return None
                 order_id = None
                 if isinstance(res, dict):
-                    order_id = res.get("orderId") or res.get("order_id")
+                    # API-svaret använder "orderID" (docs.polymarket.com/trading/orders/create)
+                    order_id = res.get("orderID") or res.get("orderId") or res.get("order_id")
                 if not order_id:
                     # Oväntad struktur – logga trunkerat svar.
                     print(f"⚠️ [Polymarket] post_order unexpected response for token {token_id}: {(str(res)[:200])!r}")
@@ -659,8 +962,12 @@ class Polymarket:
                 # endregion
                 return order_id
 
-            # Fall 2: ingen ask‑likviditet → agera maker med limit‑BUY (GTC) om vi har ett takpris.
+            # Fall 2: ingen ask‑likviditet → maker BUY (GTC). MAGNUS_BUY_FOK_ONLY=1: skippa, köp ENDAST vid FOK.
+            fok_only = os.getenv("MAGNUS_BUY_FOK_ONLY", "1").strip().lower() in ("1", "true", "yes")
             if ask_liq <= 0:
+                if fok_only:
+                    print(f"ℹ️ [Polymarket] No ask liquidity – skippar (MAGNUS_BUY_FOK_ONLY=1). Endast FOK-köp, ingen GTC.")
+                    return None
                 if max_price is None or max_price <= 0:
                     print(f"⚠️ [Polymarket] No ask liquidity and no MAX_PRICE for token {token_id}; skipping buy.")
                     return None
@@ -750,8 +1057,23 @@ class Polymarket:
                         size=est_shares,
                         side="BUY",
                     )
-                    signed = self.client.create_order(order_args)
-                    res = self.client.post_order(signed, OrderType.GTC)
+                    options = self._get_order_options(token_id, getattr(market_to_buy, "conditionId", None))
+                    last_err: Optional[Exception] = None
+                    for attempt in range(3):
+                        try:
+                            signed = self.client.create_order(order_args, options)
+                            res = self.client.post_order(signed, OrderType.GTC)
+                            break
+                        except Exception as e:
+                            last_err = e
+                            err_str = str(e)
+                            if attempt < 2 and ("Request exception" in err_str or "Server disconnected" in err_str or "RemoteProtocolError" in err_str):
+                                time.sleep(2.0 + attempt)
+                                continue
+                            raise
+                    else:
+                        if last_err is not None:
+                            raise last_err
                     if not res:
                         print(f"⚠️ [Polymarket] post_order (maker BUY) returned empty response for token {token_id}.")
                         # region agent log
@@ -811,7 +1133,8 @@ class Polymarket:
                         return None
                     order_id = None
                     if isinstance(res, dict):
-                        order_id = res.get("orderId") or res.get("order_id") or res.get("id")
+                        # API-svaret använder "orderID" (docs.polymarket.com/trading/orders/create)
+                        order_id = res.get("orderID") or res.get("orderId") or res.get("order_id") or res.get("id")
                     if not order_id:
                         print(f"⚠️ [Polymarket] post_order (maker BUY) unexpected response for token {token_id}: {(str(res)[:200])!r}")
                         return None
@@ -819,23 +1142,50 @@ class Polymarket:
                         f"ℹ️ [Polymarket] Placed maker BUY (GTC) for token {token_id} at {limit_price:.3f} "
                         f"for ~{est_shares:.2f} shares."
                     )
+                    # Verifiera att ordern syns i CLOB (heartbeat håller den levande)
+                    try:
+                        open_orders = self.get_open_orders(asset_id=str(token_id))
+                        n = len(open_orders)
+                        if n > 0:
+                            maker = (open_orders[0].get("maker_address") or open_orders[0].get("maker") or "?")
+                            print(f"   ✓ CLOB har {n} öppen order (maker={maker[:10]}…{maker[-6:]}) – polymarket.com/portfolio?tab=open")
+                        else:
+                            print(f"   ⚠️ CLOB returnerar 0 öppna ordrar – kontrollera polymarket.com. Heartbeat måste köra.")
+                    except Exception:
+                        pass
                     return order_id
                 except Exception as e:
-                    logger.exception("execute_market_order maker BUY exception for token %s: %s", token_id, str(e)[:200])
+                    err_str = str(e)
+                    logger.exception("execute_market_order maker BUY exception for token %s: %s", token_id, err_str[:200])
+                    if "invalid signature" in err_str.lower():
+                        print(
+                            "   💡 Invalid signature: Om du använder MetaMask och har depositat: sätt POLYGON_SIGNATURE_TYPE=2 "
+                            "och POLYMARKET_FUNDER_ADDRESS till proxy-adressen (polymarket.com/settings). "
+                            "Om du nyligen börjat använda deposit: kör create_polymarket_api_creds.py igen för att om-derivera API-nycklar."
+                        )
                     return None
         except Exception as e:
-            logger.exception("execute_market_order exception for token %s: %s", token_id, str(e)[:200])
+            err_str = str(e)
+            logger.exception("execute_market_order exception for token %s: %s", token_id, err_str[:200])
+            if "invalid signature" in err_str.lower():
+                print(
+                    "   💡 Invalid signature: Om du använder MetaMask och har depositat: sätt POLYGON_SIGNATURE_TYPE=2 "
+                    "och POLYMARKET_FUNDER_ADDRESS till proxy-adressen (polymarket.com/settings). "
+                    "Om du nyligen börjat använda deposit: kör create_polymarket_api_creds.py igen för att om-derivera API-nycklar."
+                )
             return None
 
     def execute_sell_order(self, token_id: str, shares: float, price: float) -> bool:
         """
         Lägger en limit‑SELL order för ett token vid givet pris.
+        API: create_order(OrderArgs(token_id, price, size=shares, side=SELL), options) + post_order(..., OrderType.GTC).
         """
         try:
             # Limit‑SELL via OrderArgs → GTC‑order som vilar i boken tills matchad.
             limit_price = float(price)
             size = float(shares)
             if limit_price <= 0 or size <= 0:
+                logger.warning("execute_sell_order: invalid price=%s or size=%s", limit_price, size)
                 return False
             order_args = OrderArgs(
                 token_id=str(token_id),
@@ -843,13 +1193,19 @@ class Polymarket:
                 size=size,
                 side="SELL",
             )
-            signed = self.client.create_order(order_args)
+            options = self._get_order_options(str(token_id))
+            signed = self.client.create_order(order_args, options)
             res = self.client.post_order(signed, OrderType.GTC)
             if not res:
+                logger.warning("execute_sell_order: post_order returned empty for token %s", token_id)
                 return False
             if isinstance(res, dict) and res.get("error"):
+                err = res.get("error")
+                err_msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
+                logger.warning("execute_sell_order: post_order error for token %s: %s", token_id, err_msg[:120])
                 return False
             return True
-        except Exception:
+        except Exception as e:
+            logger.exception("execute_sell_order failed for token %s at %.3f: %s", token_id, float(price), str(e)[:100])
             return False
 

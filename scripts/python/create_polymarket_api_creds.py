@@ -37,10 +37,18 @@ def main() -> None:
         raise SystemExit("PRIVATE_KEY saknas i .env – kan inte skapa API‑nycklar.")
 
     try:
-        signature_type = int(os.getenv("POLYGON_SIGNATURE_TYPE", "1"))
+        signature_type = int(os.getenv("POLYGON_SIGNATURE_TYPE", "2"))
     except ValueError:
-        signature_type = 1
+        signature_type = 2
     funder_address = os.getenv("POLYMARKET_FUNDER_ADDRESS", "").strip() or None
+    if signature_type == 0:
+        from eth_account import Account
+        funder_address = Account.from_key(private_key).address
+    elif signature_type in (1, 2) and not (funder_address and funder_address.startswith("0x")):
+        raise SystemExit(
+            "POLYMARKET_FUNDER_ADDRESS krävs för signature type 1/2 (proxy). "
+            "Hitta adressen på polymarket.com/settings."
+        )
 
     client = ClobClient(
         host="https://clob.polymarket.com",
@@ -53,20 +61,28 @@ def main() -> None:
     print("🔑 Skapar/deriverar CLOB API‑credentials via L1 (PRIVATE_KEY)…")
     creds = client.create_or_derive_api_creds()
 
-    # `creds` är normalt ett ApiCreds‑objekt från py_clob_client.
+    # `creds` är normalt ett ApiCreds‑objekt från py_clob_client (fält: api_key, api_secret, api_passphrase).
     # För säkerhets skull hanterar vi både objekt‑ och dict‑form.
     api_key = (
         getattr(creds, "key", None)
         or getattr(creds, "apiKey", None)
         or getattr(creds, "api_key", None)
     )
-    secret = getattr(creds, "secret", None) or getattr(creds, "apiSecret", None)
-    passphrase = getattr(creds, "passphrase", None) or getattr(creds, "apiPassphrase", None)
+    secret = (
+        getattr(creds, "secret", None)
+        or getattr(creds, "apiSecret", None)
+        or getattr(creds, "api_secret", None)
+    )
+    passphrase = (
+        getattr(creds, "passphrase", None)
+        or getattr(creds, "apiPassphrase", None)
+        or getattr(creds, "api_passphrase", None)
+    )
 
     if isinstance(creds, dict):
         api_key = api_key or creds.get("apiKey") or creds.get("key") or creds.get("api_key")
-        secret = secret or creds.get("secret") or creds.get("apiSecret")
-        passphrase = passphrase or creds.get("passphrase") or creds.get("apiPassphrase")
+        secret = secret or creds.get("secret") or creds.get("apiSecret") or creds.get("api_secret")
+        passphrase = passphrase or creds.get("passphrase") or creds.get("apiPassphrase") or creds.get("api_passphrase")
 
     if not (api_key and secret and passphrase):
         raise SystemExit(f"Misslyckades att extrahera apiKey/secret/passphrase ur svar: {creds!r}")

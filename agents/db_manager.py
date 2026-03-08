@@ -206,6 +206,23 @@ class DatabaseManager:
             print(f"❌ DB Update Status Error: {e}")
             return False
 
+    def delete_trade(self, trade_id: int | None = None, token_id: str | None = None) -> bool:
+        """Ta bort en trade (t.ex. phantom där ordern avbröts innan fill). Ange trade_id eller token_id."""
+        if trade_id is None and not token_id:
+            return False
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                if trade_id is not None:
+                    cursor.execute("DELETE FROM trades WHERE id = ?", (trade_id,))
+                else:
+                    cursor.execute("DELETE FROM trades WHERE token_id = ?", (str(token_id),))
+                conn.commit()
+                return cursor.rowcount > 0
+        except Exception as e:
+            print(f"❌ DB Delete Trade Error: {e}")
+            return False
+
     def set_selling_flags(self, token_id: str, in_progress: bool, active_in_book: bool) -> bool:
         """Set flags to prevent duplicate sell attempts."""
         try:

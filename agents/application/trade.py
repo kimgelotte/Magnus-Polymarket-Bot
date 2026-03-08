@@ -61,19 +61,19 @@ class Trade:
             self.min_bet_usdc = 1.0
         self.min_shares_to_buy = 5.0   # Polymarket: minst 5 andelar vid sälj – vi måste köpa minst så många
         try:
-            self.price_move_tolerance = float(os.getenv("MAGNUS_PRICE_MOVE_TOLERANCE", "0.05"))
+            self.price_move_tolerance = float(os.getenv("MAGNUS_PRICE_MOVE_TOLERANCE", "0.02"))
         except ValueError:
-            self.price_move_tolerance = 0.05  # Tillåt 5¢ rörelse under analys innan vi skippar
+            self.price_move_tolerance = 0.02  # Max 2¢ rörelse under analys – snabbare skippa vid prisstigning
         # Min andel av saldo per godkänt köp – Kelly kan bli väldigt liten vid låg fair value; då använd minst denna andel
         try:
             self.min_bet_pct_balance = float(os.getenv("MAGNUS_MIN_BET_PCT_BALANCE", "0.08"))
         except ValueError:
             self.min_bet_pct_balance = 0.08   # 8% av saldo som minst vid godkänt köp (36 USDC → ~2.9 USDC)
-        # Minsta brutto‑profit per trade (USDC) – så avgifter blir en del av vinsten, inte hela vinsten.
+        # Minsta brutto‑profit per trade (USDC). Sänk (t.ex. 0.05) så fler godkända BUY blir faktiska ordrar.
         try:
-            self.min_gross_profit_usdc = float(os.getenv("MAGNUS_MIN_GROSS_PROFIT_USDC", "0.25"))
+            self.min_gross_profit_usdc = float(os.getenv("MAGNUS_MIN_GROSS_PROFIT_USDC", "0.05"))
         except ValueError:
-            self.min_gross_profit_usdc = 0.25
+            self.min_gross_profit_usdc = 0.05
         # Tighter stop-loss to improve risk/reward
         self.stop_loss_pct = 0.15
         # Bred band så nästan-avgjorda (0.1¢–99.9¢) når analys; Quant avvisar om ingen edge
@@ -287,6 +287,25 @@ class Trade:
                 sys.stdout.flush()
 
                 actual_balance = positions_map.get(str(t_id), 0.0)
+                target_price = float(t.get('target_price') or 0)
+                # Saknad GTC-sälj: om vi har andelar men ingen säljorder, lägg en
+                if actual_balance >= 5.0 and target_price >= 0.01:
+                    try:
+                        open_orders = self.polymarket.get_open_orders(asset_id=str(t_id))
+                        orders_list = open_orders.get("data", open_orders) if isinstance(open_orders, dict) else (open_orders or [])
+                        has_sell = any(
+                            str(getattr(o, "side", o.get("side", "") if isinstance(o, dict) else "")).upper() == "SELL"
+                            for o in (orders_list if isinstance(orders_list, list) else [])
+                        )
+                        if not has_sell:
+                            print(f"\n📤 Saknad GTC-sälj – lägger target {target_price:.2f} för {t['question'][:35]}…")
+                            ok = self.polymarket.execute_sell_order(t_id, actual_balance, target_price)
+                            if ok:
+                                print(f"   ✓ GTC sell order placerad.")
+                            else:
+                                print(f"   ⚠️ GTC sell misslyckades – se logg.")
+                    except Exception as e:
+                        logger.warning("Saknad GTC-sälj check failed for %s: %s", t_id, str(e)[:80])
                 if actual_balance < 0.01:
                     buy_price = float(t.get('buy_price') or 0)
                     target_price = float(t.get('target_price') or 0)
@@ -443,6 +462,9 @@ class Trade:
         self.active_observer = MagnusObserver(token_ids, self)
         self.active_observer.start()
 
+        # 1b. CLOB heartbeat – utan detta avbryts GTC-ordrar inom ~10s (Polymarket krav)
+        self.polymarket.start_heartbeat()
+
         # 2. Scanner queue (Bouncer in scanner – only PASS in queue)
         candidate_queue = queue.Queue(maxsize=500)
         # Scan cadence and dedup TTL can be tuned via env
@@ -458,10 +480,12 @@ class Trade:
             event_limit = int(os.getenv("MAGNUS_SCANNER_EVENT_LIMIT", "2500"))  # events per strategy; höj för fler kandidater
         except ValueError:
             event_limit = 2500
+        _strat_env = os.getenv("MAGNUS_SCANNER_STRATEGIES", "").strip()
+        strategies = [s.strip() for s in _strat_env.split(",") if s.strip()] if _strat_env else ["liquid", "undiscovered", "new"]
         scanner = MarketScanner(
             candidate_queue,
             self,
-            strategies=["trending", "featured", "new"],  # trending + new = många events; featured = ~21 från API
+            strategies=strategies,
             event_limit=event_limit,
             dedup_ttl_seconds=dedup_ttl,
             sleep_between_rounds_seconds=scan_interval,
@@ -494,20 +518,8 @@ class Trade:
                     """Run War Room for batch; returns (new_balance, skip_rest). skip_bouncer=True for scanner candidates."""
                     skip_rest = False
                     payloads = [c["market_for_ai"] for c in batch_list]
-                    try:
-                        if len(payloads) == 1:
-                            raw = _loop.run_until_complete(self.war_room.evaluate_market(payloads[0], skip_bouncer=skip_bouncer))
-                            results = [raw]
-                        else:
-                            tasks = [_loop.create_task(self.war_room.evaluate_market(m, skip_bouncer=skip_bouncer)) for m in payloads]
-                            results = _loop.run_until_complete(asyncio.gather(*tasks, return_exceptions=True))
-                    except Exception as war_err:
-                        err_short = str(war_err)[:120]
-                        print(f"\n⚠️ War Room error (batch): {err_short}")
-                        logger.exception("War Room batch error: %s", err_short)
-                        self._log_to_live(f"⚠️ War Room batch error: {err_short}")
-                        results = [{"action": "REJECT", "reason": f"Error: {war_err}", "max_price": 0.0, "hype_score": 0} for _ in batch_list]
-                    for c, raw in zip(batch_list, results):
+                    def _process_one(c, raw, bal, skip):
+                        """Bearbeta ett War Room-resultat; returnerar (ny_balance, ny_skip_rest)."""
                         # Normalisera beslut så vi alltid har konsekvent struktur (ingen tyst default-risk).
                         decision = raw if isinstance(raw, dict) else {"action": "REJECT", "reason": f"Error: {raw}", "max_price": 0.0, "hype_score": 0}
                         decision["action"] = (decision.get("action") or "REJECT").strip().upper()
@@ -603,6 +615,7 @@ class Trade:
                         else:
                             print(f"   → APPROVED: {title_short} | max {decision.get('max_price', 0):.2f}", flush=True)
                         if decision.get('action') == "BUY":
+                            print(f"   🔍 Processing BUY: {title_short[:40]}... (max {decision.get('max_price', 0):.2f})", flush=True)
                             # region agent log
                             try:
                                 import json as _json  # lokal alias för debug-loggning
@@ -641,12 +654,12 @@ class Trade:
                                     msg = f"Already {n} position(s) in this event (max {self.max_positions_per_event}). Skipping buy."
                                     print(f"   ⏸️ {msg}")
                                     self._log_to_live(f"⏸️ {msg}")
-                                continue
+                                return (bal, skip)
                             if self.portfolio_risk.check_correlation(full_title, e_category):
                                 msg = f"Too many correlated positions in {e_category}. Skipping buy."
                                 print(f"   ⏸️ {msg}")
                                 self._log_to_live(f"⏸️ {msg}")
-                                continue
+                                return (bal, skip)
                             days_until_end = c.get("market_for_ai", {}).get("days_until_end")
                             change_1h = price_context.get("change_1h")
                             # Avoid catching falling knives in high-risk categories
@@ -657,17 +670,17 @@ class Trade:
                                 and change_1h < -5.0
                             ):
                                 print(f"   ⏸️ Short-term momentum too negative ({change_1h}%). Skipping buy.")
-                                continue
+                                return (bal, skip)
                             min_days = getattr(self, "min_days_to_buy", 0.2)
                             if days_until_end is not None and isinstance(days_until_end, (int, float)) and min_days > 0 and days_until_end < min_days:
                                 self._log_to_live(f"⏸️ Too little time left (< {min_days} day). Skipping buy.")
                                 print(f"   ⏸️ Too little time left (< {min_days} day). Skipping buy.")
-                                continue
+                                return (bal, skip)
                             open_count = len(self.db.get_open_positions())
                             if open_count >= self.max_open_positions:
                                 self._log_to_live(f"⏸️ Max open positions ({self.max_open_positions}). Skipping new buy.")
                                 print(f"   ⏸️ Max open positions ({self.max_open_positions}). Skipping new buy.")
-                                continue
+                                return (bal, skip)
                             is_price_market = False
                             if self.require_below_avg:
                                 in_lower = price_context.get("in_lower_half")
@@ -684,15 +697,20 @@ class Trade:
                                 if is_price_market and e_category in self.high_risk_categories:
                                     if not in_lower:
                                         print(f"   ⏸️ Skipping buy (price-market, high risk): not in lower half of range.")
-                                        continue
+                                        return (bal, skip)
                                 elif not (in_lower or under_avg or allow_exception):
                                     msg = "Skipping buy: price at/near average (no price edge)."
                                     print(f"   ⏸️ {msg}")
                                     self._log_to_live(f"⏸️ {msg}")
-                                    continue
+                                    return (bal, skip)
                             ai_max_price = float(decision.get('max_price', 0.0) or 0.0)
-                            # Om Quant säger köp, lita på det – bara mjuk säkerhetscap (0.99); high-risk lite lägre (0.90)
-                            ai_cap = 0.90 if e_category in self.high_risk_categories else 0.99
+                            # Måste finnas utrymme för vinst inkl. avgifter. MAGNUS_MAX_BUY_PRICE (default 0.6) = max 40¢/andel.
+                            try:
+                                max_buy = float(os.getenv("MAGNUS_MAX_BUY_PRICE", "0.6"))
+                            except ValueError:
+                                max_buy = 0.6
+                            max_buy = max(0.01, min(0.99, max_buy))
+                            ai_cap = min(max_buy, 0.75) if e_category in self.high_risk_categories else max_buy
                             ai_max_price = min(ai_max_price, ai_cap)
                             # Quant sa BUY – kräv bara att vi inte betalar över deras max (ingen extra edge-spärr)
                             if current_price <= ai_max_price:
@@ -701,18 +719,21 @@ class Trade:
                                     kelly_frac = 0.20 if not self.uncertain_market else 0.10
                                 else:
                                     kelly_frac = 0.30 if self.uncertain_market else 0.45
-                                bet = self.risk.calculate_kelly_bet(ai_max_price, current_price, balance, kelly_fraction=kelly_frac)
+                                bet = self.risk.calculate_kelly_bet(ai_max_price, current_price, bal, kelly_fraction=kelly_frac)
                                 # Kelly kan bli väldigt liten – använd minst X% av saldo
-                                bet_floor = balance * getattr(self, "min_bet_pct_balance", 0.05)
+                                bet_floor = bal * getattr(self, "min_bet_pct_balance", 0.05)
                                 bet = max(bet, bet_floor)
                                 bet = min(bet, self.max_bet_usdc)
                                 # Färskt pris (ingen cache) så vi inte skippar pga gammal data eller cache/CLOB-skillnad
                                 price_now = self.polymarket.get_buy_price(token_id, use_cache=False)
-                                # Tillåt rimlig rörelse (5¢ default) under analys; skippa bara vid tydlig flytt över vårt max
-                                price_tolerance = getattr(self, "price_move_tolerance", 0.05)
+                                if price_now is None or price_now <= 0:
+                                    print(f"   ⚠️ Price now {price_now!r} – no valid bid/ask; skipping buy.")
+                                    return (bal, skip)
+                                # Ingen tolerance uppåt – om priset stigit under analys, skippa. (MAGNUS_PRICE_MOVE_TOLERANCE=0.02 ger 2¢ buffer.)
+                                price_tolerance = getattr(self, "price_move_tolerance", 0.02)
                                 if price_now > ai_max_price + price_tolerance:
                                     print(f"   ⚠️ Price moved during analysis: {current_price:.2f} → {price_now:.2f} (max {ai_max_price}). Skipping buy.")
-                                    continue
+                                    return (bal, skip)
                                 # Säkerhetsband: inte över vårt globala max; high-risk lite lägre
                                 price_cap = self.max_entry_price
                                 if e_category in self.high_risk_categories:
@@ -720,21 +741,21 @@ class Trade:
                                 min_p = getattr(self, "min_entry_price", 0.10)
                                 if price_now < min_p or price_now > price_cap:
                                     print(f"   ⚠️ Price out of band ({price_now:.2f} > {price_cap:.2f}). Skipping buy.")
-                                    continue
+                                    return (bal, skip)
                                 # Om vi ska köpa så köper vi alltid – tryck upp till minst $1 och 5 andelar (Polymarket-krav)
                                 min_bet_polymarket = max(self.min_bet_usdc, self.min_shares_to_buy * price_now)
                                 bet = max(bet, min_bet_polymarket)
                                 bet = min(bet, self.max_bet_usdc)
-                                if bet > balance:
-                                    print(f"   ⚠️ Saldo {balance:.2f} USDC räcker inte för {bet:.2f} USDC. Skipping.")
-                                    continue
+                                if bet > bal:
+                                    print(f"   ⚠️ Saldo {bal:.2f} USDC räcker inte för {bet:.2f} USDC. Skipping.")
+                                    return (bal, skip)
                                 # Säkerställ att förväntad brutto‑profit i USDC är värd avgifter och risk.
                                 edge_per_share = max(0.0, ai_max_price - price_now)
                                 if edge_per_share <= 0:
                                     msg = f"Expected edge per share ≤ 0 (max {ai_max_price:.3f} vs price {price_now:.3f}). Skipping."
                                     print(f"   ⚠️ {msg}")
                                     self._log_to_live(f"⚠️ {msg}")
-                                    continue
+                                    return (bal, skip)
                                 est_shares = bet / price_now if price_now > 0 else 0.0
                                 est_gross_profit = edge_per_share * est_shares
                                 if est_gross_profit < getattr(self, "min_gross_profit_usdc", 0.0):
@@ -744,8 +765,8 @@ class Trade:
                                     )
                                     print(f"   ⚠️ {msg}")
                                     self._log_to_live(f"⚠️ {msg}")
-                                    continue
-                                print(f"\n💎 Approved for buy. Price now: {price_now:.2f}. Placing order ({bet:.2f} USDC, ≥5 shares).")
+                                    return (bal, skip)
+                                print(f"\n💎 Approved for buy. Price now: {price_now:.2f}. Placing order ({bet:.2f} USDC, ≥5 shares).", flush=True)
                                 # region agent log
                                 try:
                                     import json as _json  # lokal alias för debug-loggning
@@ -764,7 +785,7 @@ class Trade:
                                                         "price_now": price_now,
                                                         "ai_max_price": ai_max_price,
                                                         "bet": bet,
-                                                        "balance": balance,
+                                                        "balance": bal,
                                                     },
                                                     "timestamp": int(time.time() * 1000),
                                                 }
@@ -804,37 +825,42 @@ class Trade:
                                     pass
                                 # endregion
                                 if order_id:
+                                    # FOK fylls direkt; maker BUY (GTC) vilar på boken – polla för fill
                                     time.sleep(2)
                                     actual_shares = self.polymarket.get_token_balance(token_id)
-                                    for _ in range(3):
+                                    for _ in range(12):  # ~36s total för GTC
                                         if actual_shares and actual_shares >= 5.0:
                                             break
                                         time.sleep(3)
                                         actual_shares = self.polymarket.get_token_balance(token_id)
                                     actual_fill_price = round(bet / actual_shares, 3) if actual_shares and actual_shares > 0 else price_now
-                                    print(f"✅ Buy complete! Receipt: #{order_id} | Fill: {actual_fill_price:.3f} (shares: {actual_shares:.2f})")
-                                    _d_end = c.get("market_for_ai", {}).get("days_until_end")
-                                    _r_pct = price_context.get("range_pct", 0)
-                                    _hype = int(decision.get("hype_score") or 0)
-                                    target_price = compute_dynamic_target(
-                                        fill_price=actual_fill_price,
-                                        days_until_end=_d_end,
-                                        range_pct=_r_pct,
-                                        hype_score=_hype,
-                                        spread_pct=spread_pct,
-                                        ai_max_price=ai_max_price,
-                                        base_target_pct=self.profit_target,
-                                        high_target_pct=self.profit_target_high,
-                                        price_high_threshold=self.price_high_threshold,
-                                    )
-                                    self.db.log_new_trade(
-                                        token_id=token_id, market_id=m_id, question=full_title, buy_price=actual_fill_price,
-                                        amount_usdc=bet, shares_bought=actual_shares, notes=decision.get('reason', 'Buy approved'),
-                                        category=e_category, spread_pct=spread_pct, target_price=target_price, end_date_iso=end_date_str,
-                                        event_id=event_id or None,
-                                    )
-                                    print("💾 Order saved to DB.")
-                                    if actual_shares >= 5.0:
+                                    if actual_shares and actual_shares >= 5.0:
+                                        print(f"✅ Buy complete! Receipt: #{order_id} | Fill: {actual_fill_price:.3f} (shares: {actual_shares:.2f})")
+                                    else:
+                                        print(f"📋 Order placed (GTC). Receipt: #{order_id} | Shares: {(actual_shares or 0):.2f} – order på boken, väntar på fill. Inte loggat till DB.")
+                                    # Logga endast till DB när vi faktiskt har andelar (undvik phantom)
+                                    if actual_shares and actual_shares >= 5.0:
+                                        _d_end = c.get("market_for_ai", {}).get("days_until_end")
+                                        _r_pct = price_context.get("range_pct", 0)
+                                        _hype = int(decision.get("hype_score") or 0)
+                                        target_price = compute_dynamic_target(
+                                            fill_price=actual_fill_price,
+                                            days_until_end=_d_end,
+                                            range_pct=_r_pct,
+                                            hype_score=_hype,
+                                            spread_pct=spread_pct,
+                                            ai_max_price=ai_max_price,
+                                            base_target_pct=self.profit_target,
+                                            high_target_pct=self.profit_target_high,
+                                            price_high_threshold=self.price_high_threshold,
+                                        )
+                                        self.db.log_new_trade(
+                                            token_id=token_id, market_id=m_id, question=full_title, buy_price=actual_fill_price,
+                                            amount_usdc=bet, shares_bought=actual_shares, notes=decision.get('reason', 'Buy approved'),
+                                            category=e_category, spread_pct=spread_pct, target_price=target_price, end_date_iso=end_date_str,
+                                            event_id=event_id or None,
+                                        )
+                                        print("💾 Order saved to DB.")
                                         sell_ok = self.polymarket.execute_sell_order(token_id, actual_shares, target_price)
                                         if not sell_ok:
                                             time.sleep(5)
@@ -843,12 +869,12 @@ class Trade:
                                             print(f"   📤 GTC sell order active: {target_price:.2f}")
                                         else:
                                             print(f"   ⚠️ GTC sell order failed – run restore_sell_orders.py at {target_price:.2f}")
-                                    if self.active_observer:
-                                        self.active_observer.add_token(token_id, actual_fill_price, full_title, target_price=target_price)
-                                        print(f"📡 WebSocket monitoring active.")
-                                    balance -= bet
+                                        if self.active_observer:
+                                            self.active_observer.add_token(token_id, actual_fill_price, full_title, target_price=target_price)
+                                            print(f"📡 WebSocket monitoring active.")
+                                        bal -= bet
                                 else:
-                                    print("❌ Buy failed on-chain.")
+                                    print("❌ Buy failed – ingen order placerad. (FOK: ingen match? MAGNUS_BUY_FOK_ONLY=1 och ingen ask?)", flush=True)
                             else:
                                 msg = f"No edge (Price: {current_price} / AI Max: {ai_max_price})."
                                 print(f"   ⚠️ {msg}")
@@ -856,15 +882,56 @@ class Trade:
                         elif decision.get('action') == "REJECT":
                             reason = decision.get('reason', '')
                             if "Gatekeeper" in reason or "Lawyer" in reason:
-                                skip_rest = True
+                                skip = True
+                        return (bal, skip)
+
+                    async def _run_async():
+                        bal, skip = balance, skip_rest
+                        if len(payloads) == 1:
+                            raw = await self.war_room.evaluate_market(payloads[0], skip_bouncer=skip_bouncer)
+                            bal, skip = _process_one(batch_list[0], raw, bal, skip)
+                        else:
+                            async def _eval_with_idx(idx, m):
+                                raw = await self.war_room.evaluate_market(m, skip_bouncer=skip_bouncer)
+                                return (idx, raw)
+                            tasks = [_loop.create_task(_eval_with_idx(i, m)) for i, m in enumerate(payloads)]
+                            task_to_idx = {t: i for i, t in enumerate(tasks)}
+                            pending = set(tasks)
+                            while pending and not skip:
+                                done_set, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                                if skip:
+                                    for t in pending:
+                                        t.cancel()
+                                    break
+                                for t in done_set:
+                                    try:
+                                        idx, raw = t.result()
+                                    except asyncio.CancelledError:
+                                        continue
+                                    except Exception as e:
+                                        idx = task_to_idx.get(t, 0)
+                                        raw = {"action": "REJECT", "reason": str(e)[:200], "max_price": 0.0, "hype_score": 0}
+                                    c = batch_list[idx]
+                                    bal, skip = _process_one(c, raw, bal, skip)
+                        return (bal, skip)
+
+                    try:
+                        balance, skip_rest = _loop.run_until_complete(_run_async())
+                    except Exception as war_err:
+                        err_short = str(war_err)[:120]
+                        print(f"\n⚠️ War Room error (batch): {err_short}")
+                        logger.exception("War Room batch error: %s", err_short)
+                        self._log_to_live(f"⚠️ War Room batch error: {err_short}")
+                        for c in batch_list:
+                            balance, skip_rest = _process_one(c, {"action": "REJECT", "reason": f"Error: {war_err}", "max_price": 0.0, "hype_score": 0}, balance, skip_rest)
                     print("─" * 60, flush=True)
                     return (balance, skip_rest)
 
                 # 3. Consumer: pull from scanner queue, run War Room (Bouncer already in scanner)
                 try:
-                    WAR_ROOM_BATCH_SIZE = int(os.getenv("MAGNUS_WAR_ROOM_BATCH_SIZE", "8"))
+                    WAR_ROOM_BATCH_SIZE = int(os.getenv("MAGNUS_WAR_ROOM_BATCH_SIZE", "4"))
                 except ValueError:
-                    WAR_ROOM_BATCH_SIZE = 8
+                    WAR_ROOM_BATCH_SIZE = 4
                 WAR_ROOM_BATCH_SIZE = max(1, min(WAR_ROOM_BATCH_SIZE, 8))
                 batch_list = []
                 for _ in range(WAR_ROOM_BATCH_SIZE):
@@ -875,17 +942,21 @@ class Trade:
                         break
                 if not batch_list:
                     self._consumer_empty_count = getattr(self, "_consumer_empty_count", 0) + 1
+                    qsize = candidate_queue.qsize()
                     if self._consumer_empty_count == 1 or self._consumer_empty_count % 6 == 0:
                         print(f"\n💵 Balance: {balance:.2f} USDC", flush=True)
                         self._log_to_live(f"💓 Heartbeat | Balance: {balance:.2f} USDC")
-                        print(f"⏳ No candidates in queue – väntar på scanner… ({self._consumer_empty_count}x)", flush=True)
+                        print(f"⏳ Kön tom (qsize={qsize}) – väntar på scanner… ({self._consumer_empty_count}x)", flush=True)
                     time.sleep(5)
                     continue
+                qsize_after = candidate_queue.qsize()
                 print(f"\n💵 Balance: {balance:.2f} USDC")
                 self._log_to_live(f"💓 Heartbeat | Balance: {balance:.2f} USDC")
                 batch_list = [c for c in batch_list if c.get("market_for_ai") and c.get("full_title")]
                 if not batch_list:
                     continue
+                # Billigast först – vi vill köpa innan priset hinner röra sig
+                batch_list.sort(key=lambda c: float(c.get("current_price") or 0.99))
                 self._consumer_empty_count = 0
                 for c in batch_list:
                     try:
@@ -900,7 +971,7 @@ class Trade:
                     except Exception:
                         pass
                 print("\n" + "═" * 60, flush=True)
-                print("🧠 WAR ROOM – analyserar " + str(len(batch_list)) + " kandidat(er)", flush=True)
+                print("🧠 WAR ROOM – plockade " + str(len(batch_list)) + " från kön (återstår " + str(qsize_after) + ") – analyserar:", flush=True)
                 print("═" * 60, flush=True)
                 for c in batch_list:
                     title = str(c.get("full_title") or "")[:56]

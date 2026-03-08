@@ -16,7 +16,7 @@ Han handlar inte “up or down”, utan jagar **prisrörelser**: köpa billigt, 
 - `agents/observer.py` – enkel observer‑tråd för öppna positioner.
 - `scripts/python/cli.py` – CLI‑entrypoint (`python -m scripts.python.cli run-autonomous-trader`).
 - `scripts/revoke_polymarket_keys.py` – hjälpskript för att rotera Polymarket USER‑API‑nyckel via L1.
-- `.env` – lokala hemligheter (privatnyckel, API‑nycklar, inställningar). **Ska aldrig in i git.**
+- `.env` – lokala hemligheter (privatnyckel, API‑nycklar, inställningar). **Ska ALDRIG committas** – använd `.env.example` som mall.
 
 ### Krav
 
@@ -85,6 +85,7 @@ python3 -m scripts.python.cli run-autonomous-trader
 
 ### Säkerhet
 
+- **`.env`** är i `.gitignore` – committa aldrig denna fil.
 - Rotera alltid **privata nycklar** och API‑nycklar vid läckor.
 - Låt aldrig `.env` eller privata nycklar hamna i git eller på GitHub.
 - Använd en dedikerad bot‑wallet (inte din personliga huvudwallet) för Magnus.

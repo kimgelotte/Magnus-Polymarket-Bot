@@ -2,8 +2,19 @@ import os
 import asyncio
 import httpx
 import re
+import threading
 from datetime import datetime, timezone
 from dotenv import load_dotenv
+
+# Lås för att undvika interleaving när flera marknader analyseras parallellt
+_print_lock = threading.Lock()
+
+
+def _print_block(*args, **kwargs):
+    """Thread-safe print som håller varje marknadsblock sammanhängande."""
+    with _print_lock:
+        print(*args, **kwargs)
+
 
 class MagnusWarRoom:
     SHARED_GOAL = (
@@ -51,6 +62,8 @@ class MagnusWarRoom:
         load_dotenv()
         # Default 1: skippa Lawyer så fler når Scout/Quant; sätt 0 för att köra Lawyer (stramare regler).
         self.skip_lawyer = os.getenv("MAGNUS_SKIP_LAWYER", "1").strip().lower() in ("1", "true", "yes")
+        # 1 = skippa Tavily/NewsAPI (sparar 5–15s per marknad – snabbare till köp)
+        self.skip_research = os.getenv("MAGNUS_SKIP_RESEARCH", "0").strip().lower() in ("1", "true", "yes")
         self.xai_key = os.getenv("XAI_API_KEY")
         self.ds_key = os.getenv("DEEPSEEK_API_KEY")
         self.claude_key = os.getenv("ANTHROPIC_API_KEY")
@@ -273,11 +286,11 @@ class MagnusWarRoom:
                 if resp.status_code != 200:
                     body = resp.text
                     if resp.status_code == 429 or "rate limit" in (body or "").lower() or "insufficient" in (body or "").lower():
-                        print("   ⚠️ Bouncer API: rate limit eller slut på krediter (Grok). PASS för att inte blocka.")
+                        _print_block("   ⚠️ Bouncer API: rate limit eller slut på krediter (Grok). PASS för att inte blocka.")
                     return False
                 return "PASS" in (resp.json() or {}).get("choices", [{}])[0].get("message", {}).get("content", "").strip().upper()
         except httpx.TimeoutException:
-            print("   ⚠️ Bouncer API: timeout.")
+            _print_block("   ⚠️ Bouncer API: timeout.")
             return False
         except Exception:
             return False
@@ -309,7 +322,7 @@ class MagnusWarRoom:
                 if resp.status_code != 200:
                     body = (resp.text or "").lower()
                     if resp.status_code == 429 or "rate limit" in body or "overloaded" in body or "insufficient" in body:
-                        print("   ⚠️ Lawyer API: rate limit eller slut på krediter (Claude). FAIL för denna kandidat.")
+                        _print_block("   ⚠️ Lawyer API: rate limit eller slut på krediter (Claude). FAIL för denna kandidat.")
                     return {"passed": False, "criteria_summary": ""}
                 data = resp.json()
                 text = (data.get("content") or [{}])[0].get("text", "").strip()
@@ -323,7 +336,7 @@ class MagnusWarRoom:
                             criteria_summary = text[idx + len(key):].strip().split("\n")[0][:400]
                 return {"passed": passed, "criteria_summary": criteria_summary}
         except httpx.TimeoutException:
-            print("   ⚠️ Lawyer API: timeout.")
+            _print_block("   ⚠️ Lawyer API: timeout.")
             return {"passed": False, "criteria_summary": ""}
         except Exception:
             return {"passed": False, "criteria_summary": ""}
@@ -465,7 +478,7 @@ class MagnusWarRoom:
                 if resp.status_code != 200:
                     body = (resp.text or "").lower()
                     if resp.status_code == 429 or "rate limit" in body or "insufficient" in body:
-                        print("   ⚠️ Scout API: rate limit eller slut på krediter (Grok). Använder score 5.")
+                        _print_block("   ⚠️ Scout API: rate limit eller slut på krediter (Grok). Använder score 5.")
                     return default_out
                 text = resp.json().get("choices", [{}])[0].get("message", {}).get("content", "").strip()
                 score, summary = 5, ""
@@ -482,7 +495,7 @@ class MagnusWarRoom:
                     summary = text[:500] if text else default_out["summary"]
                 return {"score": score, "summary": summary}
         except httpx.TimeoutException:
-            print("   ⚠️ Scout API: timeout.")
+            _print_block("   ⚠️ Scout API: timeout.")
             return default_out
         except Exception:
             return default_out
@@ -646,8 +659,11 @@ class MagnusWarRoom:
 
     async def evaluate_market(self, market_data: dict, skip_bouncer: bool = False) -> dict:
         q, stats = market_data.get('question', 'Unknown'), market_data.get('stats', {})
-        print(f"\n🧠 WAR ROOM ANALYSIS: {q}")
-        
+        q_short = (q[:50] + "…") if len(q) > 50 else q
+        _print_block(f"\n{'─' * 60}")
+        _print_block(f"🧠 {q_short}")
+        _print_block(f"{'─' * 60}")
+
         category = market_data.get('category', 'Unknown')
         # Skip Bouncer if candidate from scanner (already passed Gatekeeper)
         if skip_bouncer:
@@ -668,38 +684,44 @@ class MagnusWarRoom:
             return {"action": "REJECT", "reason": "Filtered by (Lawyer)", "hype_score": 0}
         criteria_summary = (lawyer_result or {}).get("criteria_summary") or ""
         if self.skip_lawyer:
-            print(f"   ⚖️ Lawyer: skipped (MAGNUS_SKIP_LAWYER)")
+            _print_block(f"   ⚖️ Lawyer: skipped (MAGNUS_SKIP_LAWYER)")
 
         # Live research (Tavily + NewsAPI + för vädermarknader: Open-Meteo-prognos) som indata till Scout
-        research_snippet = await self._fetch_research_snippet(q, category, market_data.get("end_date"))
+        research_snippet = "" if self.skip_research else await self._fetch_research_snippet(q, category, market_data.get("end_date"))
+        if self.skip_research:
+            _print_block(f"   📡 Research: skipped (MAGNUS_SKIP_RESEARCH) – snabbare till köp.")
         if research_snippet:
             if self._is_weather_market(q, category) and "Open-Meteo" in research_snippet:
-                print(f"   📡 Live research inkl. väderprognos (Open-Meteo) till Scout.")
+                _print_block(f"   📡 Live research inkl. väderprognos (Open-Meteo) till Scout.")
             else:
-                print(f"   📡 Live research (Tavily/NewsAPI) included in Scout.")
+                _print_block(f"   📡 Live research (Tavily/NewsAPI) included in Scout.")
 
         # Scout (category-specific hype score)
         hype = await self._grok_radar(q, category, research_snippet=research_snippet)
-        print(f"   🔥 Hype Score: {hype['score']}/10")
+        _print_block(f"   🔥 Hype Score: {hype['score']}/10")
 
-        # Quant (volatility, time left, price context)
+        # Quant (volatility, time left, price context) – samla i en kompakt rad
         similar_analyses = (market_data.get("similar_analyses") or "").strip()
         days_until_end = market_data.get("days_until_end")
         price_context = market_data.get("price_context") or {}
+        ctx_parts = []
         if similar_analyses:
-            print(f"   📚 Using {len(similar_analyses.split(chr(10)))} similar analyses from history.")
+            ctx_parts.append(f"📚 {len(similar_analyses.split(chr(10)))} similar analyses")
         if days_until_end is not None:
-            print(f"   ⏱️ Time to close: {days_until_end} days.")
+            ctx_parts.append(f"⏱️ {days_until_end}d")
         if price_context.get("price_vs_avg"):
-            print(f"   📉 Price vs history: {price_context.get('price_vs_avg')} (range {price_context.get('range_pct', 0)}%)")
+            rng = price_context.get("range_pct", 0)
+            ctx_parts.append(f"📉 {price_context.get('price_vs_avg')} (range {rng}%)")
         spread_pct = market_data.get("spread_pct")
         if spread_pct is not None:
-            print(f"   📊 Spread: {spread_pct}% (bid/ask)")
-        if criteria_summary:
-            print(f"   ⚖️ Lawyer criteria: {criteria_summary[:60]}…")
+            ctx_parts.append(f"📊 spread {spread_pct}%")
         if (market_data.get("event_markets_context") or "").strip():
-            print(f"   📋 Event context: other markets in same event included for comparison.")
-        print(f"   🧮 DeepSeek computing edge (this may take 30s)...", end="", flush=True)
+            ctx_parts.append("📋 event context")
+        if ctx_parts:
+            _print_block(f"   {' | '.join(ctx_parts)}")
+        if criteria_summary:
+            _print_block(f"   ⚖️ Lawyer: {criteria_summary[:60]}…")
+        _print_block(f"   🧮 DeepSeek computing edge (this may take 30s)...", end="", flush=True)
         decision = await self._deepseek_quant(
             q, market_data.get('current_price', 0.5), hype, stats, category,
             similar_analyses=similar_analyses, days_until_end=days_until_end, price_context=price_context,
@@ -708,13 +730,13 @@ class MagnusWarRoom:
             uncertain_market=bool(market_data.get("uncertain_market")),
             event_markets_context=(market_data.get("event_markets_context") or "").strip(),
         )
-        print(" Done!")
+        _print_block(" Done!")
         decision["hype_score"] = hype["score"]
 
         if decision['action'] == "BUY":
-            print(f"   ✅ APPROVED FOR BUY! (Max price: {decision['max_price']})")
+            _print_block(f"   ✅ APPROVED FOR BUY! (Max price: {decision['max_price']})")
         else:
-            print(f"   ❌ REJECTED: {decision['reason']}")
+            _print_block(f"   ❌ REJECTED: {decision['reason']}")
 
         return decision
 

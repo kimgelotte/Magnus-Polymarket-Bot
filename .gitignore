@@ -6,12 +6,15 @@ __pycache__/
 .vscode/
 .DS_Store
 
-# Local config / secrets
+# Local config / secrets – ALDRIG committa
 .env
+.env.*
+!.env.example
 .magnus_pulse
 
 # Logs & data
 *.log
+verify-clob-payload.jsonl
 *.db
 *.sqlite3
 log.txt
