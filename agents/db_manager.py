@@ -239,6 +239,23 @@ class DatabaseManager:
             print(f"❌ DB Set Flags Error: {e}")
             return False
 
+    def mark_open_positions_sell_active(self) -> int:
+        """Mark all open positions as having GTC sell orders in the book (e.g. placed manually).
+        Returns number of rows updated."""
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    UPDATE trades 
+                    SET order_active_in_book = 1, selling_in_progress = 0
+                    WHERE status = 'OPEN'
+                """)
+                conn.commit()
+                return cursor.rowcount
+        except Exception as e:
+            print(f"❌ DB Mark Sell Active Error: {e}")
+            return 0
+
 if __name__ == "__main__":
     db = DatabaseManager()
     print("✅ Database Manager initialized.")

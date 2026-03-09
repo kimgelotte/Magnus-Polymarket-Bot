@@ -24,7 +24,11 @@ def check_orders_cmd(argv: list[str] | None = None) -> None:
     funder = getattr(pm, "_l2_funder_for_balance", None) or "?"
 
     print(f"Proxy (POLYMARKET_FUNDER_ADDRESS): {funder}")
-    print(f"Öppna ordrar (CLOB): {len(orders)}")
+    if orders is None:
+        print("Öppna ordrar (CLOB): Kunde inte hämta (API-fel)")
+        orders = []
+    else:
+        print(f"Öppna ordrar (CLOB): {len(orders)}")
     print("─" * 50)
     for o in orders[:15]:
         side = o.get("side", "?")
@@ -41,6 +45,19 @@ def check_orders_cmd(argv: list[str] | None = None) -> None:
     else:
         print("─" * 50)
         print("Om polymarket.com/portfolio?tab=Open+orders är tom: CLOB har ordrarna. De är aktiva.")
+
+
+def restore_sell_orders_cmd() -> None:
+    """Återställ saknade GTC-säljordrar för öppna positioner."""
+    from scripts.python.restore_sell_orders import main as restore_main
+    restore_main()
+
+
+def mark_sell_active_cmd() -> None:
+    """Markera alla öppna positioner som att de har GTC-säljordrar (t.ex. placerade manuellt på polymarket.com)."""
+    db = DatabaseManager()
+    n = db.mark_open_positions_sell_active()
+    print(f"✅ Markerade {n} öppna positioner som att de har GTC-säljordrar i boken.")
 
 
 def run_autonomous_trader() -> None:
@@ -110,6 +127,15 @@ def main() -> None:
             delete_trade_cmd(remaining)
         elif cmd == "check-orders":
             check_orders_cmd(remaining)
+        elif cmd == "restore-sell-orders":
+            restore_sell_orders_cmd()
+        elif cmd == "mark-sell-active":
+            mark_sell_active_cmd()
+        elif cmd == "register-orphans":
+            import sys as _sys
+            _sys.argv = ["register_orphans"] + remaining
+            from scripts.python.register_orphans import main as _reg_main
+            _reg_main()
         else:
             raise SystemExit(f"Okänt kommando: {cmd}")
     except KeyboardInterrupt:

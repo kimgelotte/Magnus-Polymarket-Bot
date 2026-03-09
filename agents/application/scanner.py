@@ -194,6 +194,7 @@ class MarketScanner(threading.Thread):
             skip_spread = 0
             skip_dup = 0
             skip_queue_full = 0
+            skip_ask_liq = 0
             for count, event in enumerate(events, 1):
                 if self._stop.is_set():
                     return
@@ -208,9 +209,21 @@ class MarketScanner(threading.Thread):
                     markets = event.get("markets", [])
                     if not markets:
                         continue
-                    # Minsta rensning på event‑nivå: skippa enbart rena "up or down"-brusmarknader.
+                    # Minsta rensning på event‑nivå: skippa "up or down"-brus och manipulation-suspekta titlar.
                     if "up or down" in e_title.lower():
                         continue
+                    if self.trade._is_manipulation_suspect(e_title):
+                        continue
+                    # Volume/liquidity: hög volym men tunn orderbook = misstänkt wash trading.
+                    if self.trade.skip_manipulation_suspect:
+                        vol = event.get("volume24hr") or event.get("volume_24hr") or 0
+                        liq = event.get("liquidity") or 0
+                        try:
+                            vol_f, liq_f = float(vol), float(liq)
+                            if liq_f > 0 and vol_f > 50 * liq_f:
+                                continue  # Skippa: volym >> likviditet
+                        except (TypeError, ValueError):
+                            pass
 
                     # Håll loggen ren: standard = ingen per‑event‑rad. Sätt MAGNUS_VERBOSE_SCANNER=1 för att visa.
                     if self.verbose:
@@ -394,6 +407,16 @@ class MarketScanner(threading.Thread):
                                     "event_id": event_id,
                                 }
 
+                                # Ask-likviditet: FOK kräver att någon säljer. Konfigurerbar via MAGNUS_MIN_ASK_MULTIPLIER.
+                                ask_liq, best_ask = self.trade.polymarket._get_ask_liquidity_usdc(token_id)
+                                try:
+                                    ask_mult = float(os.getenv("MAGNUS_MIN_ASK_MULTIPLIER", "0.5"))
+                                except ValueError:
+                                    ask_mult = 0.5
+                                min_ask_usdc = max(1.0, ask_mult * 5.0 * (best_ask or current_price or 0.01))
+                                if ask_liq < min_ask_usdc:
+                                    skip_ask_liq += 1
+                                    continue
                                 # Bouncer (Option A): only PASS candidates go to queue (kan stängas av med MAGNUS_SKIP_BOUNCER_IN_SCANNER=1)
                                 to_bouncer += 1
                                 if self.trade.skip_bouncer_in_scanner:
@@ -437,6 +460,7 @@ class MarketScanner(threading.Thread):
             if skip_scan: parts.append(f"scan={skip_scan}")
             if skip_price: parts.append(f"price={skip_price}")
             if skip_liquidity: parts.append(f"liq={skip_liquidity}")
+            if skip_ask_liq: parts.append(f"ask={skip_ask_liq}")
             if skip_days: parts.append(f"days={skip_days}")
             if skip_range: parts.append(f"range={skip_range}")
             if skip_spread: parts.append(f"spread={skip_spread}")
@@ -468,6 +492,7 @@ class MarketScanner(threading.Thread):
                                     "skip_spread": skip_spread,
                                     "skip_dup": skip_dup,
                                     "skip_queue_full": skip_queue_full,
+                                    "skip_ask_liq": skip_ask_liq,
                                 },
                                 "timestamp": int(time.time() * 1000),
                             }

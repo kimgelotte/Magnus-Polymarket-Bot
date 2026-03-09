@@ -601,7 +601,10 @@ class MagnusWarRoom:
             prompt += f"\nSIMILAR PAST ANALYSES (use as reference, not as requirement):\n{similar_analyses.strip()}\n\n"
         prompt += (
             f"RULES: BUY if (1) current price is CHEAPER THAN IT IS WORTH (current price < your MAX_PRICE with margin), AND (2) realistic path to selling at a profit, AND (3) enough time left, AND (4) rules are clear enough to resolve, AND (5) spread OK or you see clear edge (REJECT only if spread > {spread_cap}% AND no edge), AND (6) MAX_PRICE is a sellable level we can plausibly reach. "
-            "REJECT only when clearly no edge: price not cheap, no path to profit, too little time, or untradable/manipulated market. When borderline: prefer BUY with conservative MAX_PRICE.\n"
+            "CRITICAL: NEVER BUY when price is at or near the historical HIGH – that is buying high and leads to selling low. REJECT if price is in the top 20% of the range with no imminent catalyst. "
+            "REJECT only when clearly no edge: price not cheap, no path to profit, too little time, or untradable/manipulated market. "
+            "REJECT if price appears pumped without catalyst (e.g. sudden spike with no news), or volume spike with no fundamental driver – these are manipulation red flags. "
+            "When borderline: prefer REJECT or BUY with very conservative MAX_PRICE. We prefer to miss trades over buying overvalued.\n"
             "MAX_PRICE must be a decimal between 0.01 and 0.99 (not percent).\n"
             "Reply exactly:\nACTION: [BUY or REJECT]\nMAX_PRICE: [number 0.01–0.99]\nREASON: [One short sentence only]"
         )

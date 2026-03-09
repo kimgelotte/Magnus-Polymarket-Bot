@@ -24,6 +24,11 @@ from py_clob_client.clob_types import (
 
 load_dotenv()
 
+
+class OrphanPositionError(Exception):
+    """Sell misslyckades med 'not enough balance/allowance' – position kan vara orphan (DB har den men CLOB ser inte token)."""
+
+
 # Verifiering: logga exakt vad som skickas till CLOB när MAGNUS_VERIFY_CLOB_PAYLOAD=1
 _VERIFY_LOG_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "verify-clob-payload.jsonl")
 
@@ -85,7 +90,9 @@ class Polymarket:
     """
 
     CLOB_HOST = "https://clob.polymarket.com"
+    DATA_API_POSITIONS_URL = "https://data-api.polymarket.com/positions"
     GAMMA_EVENTS_ENDPOINT = "https://gamma-api.polymarket.com/events"
+    GAMMA_MARKETS_ENDPOINT = "https://gamma-api.polymarket.com/markets"
     GAMMA_PUBLIC_PROFILE_URL = "https://gamma-api.polymarket.com/public-profile"
     # On‑chain USDC.e (Polymarket collateral) på Polygon
     USDC_E_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
@@ -267,11 +274,11 @@ class Polymarket:
                                 if correct_id and correct_id != last_400_id:
                                     heartbeat_id = str(correct_id)
                                     last_400_id = correct_id
-                                    logger.info("Heartbeat: använder ID från 400-svar.")
+                                    logger.debug("Heartbeat: använder ID från 400-svar.")
                                 else:
                                     heartbeat_id = ""
                                     last_400_id = None
-                                    logger.info("Heartbeat: startar om med tom ID.")
+                                    logger.debug("Heartbeat: startar om med tom ID.")
                                 continue
                         # status_code=None = nätverksfel (Request exception!) – behåll ID, retry nästa runda
                         if getattr(e, "status_code", None) is None:
@@ -301,28 +308,36 @@ class Polymarket:
             self._heartbeat_thread.join(timeout=6.0)
             self._heartbeat_thread = None
 
-    def get_open_orders(self, asset_id: Optional[str] = None) -> List[Dict[str, Any]]:
+    def get_open_orders(self, asset_id: Optional[str] = None) -> Optional[List[Dict[str, Any]]]:
         """Hämtar öppna ordrar från CLOB. asset_id = token_id för att filtrera.
-        För proxy (type 2) patchar vi POLY_ADDRESS till funder så vi får ordrar för rätt konto (samma som polymarket.com visar)."""
-        try:
-            from py_clob_client.clob_types import OpenOrderParams
-            from py_clob_client.headers import headers as _l2_headers
-            params = OpenOrderParams(asset_id=asset_id) if asset_id else None
-            orig_l2 = _l2_headers.create_level_2_headers
-            if self._l2_funder_for_balance:
-                def _l2_with_funder(signer, creds, request_args):
-                    h = orig_l2(signer, creds, request_args)
-                    h[_l2_headers.POLY_ADDRESS] = self._l2_funder_for_balance
-                    return h
-                _l2_headers.create_level_2_headers = _l2_with_funder
+        För proxy (type 2) patchar vi POLY_ADDRESS till funder så vi får ordrar för rätt konto (samma som polymarket.com visar).
+        Returnerar None vid fel (t.ex. Request exception) – anroparen ska då inte anta has_sell=False."""
+        for attempt in range(3):
             try:
-                return self.client.get_orders(params) or []
-            finally:
+                from py_clob_client.clob_types import OpenOrderParams
+                from py_clob_client.headers import headers as _l2_headers
+                params = OpenOrderParams(asset_id=asset_id) if asset_id else None
+                orig_l2 = _l2_headers.create_level_2_headers
                 if self._l2_funder_for_balance:
-                    _l2_headers.create_level_2_headers = orig_l2
-        except Exception as e:
-            logger.warning("get_open_orders failed: %s", e)
-            return []
+                    def _l2_with_funder(signer, creds, request_args):
+                        h = orig_l2(signer, creds, request_args)
+                        h[_l2_headers.POLY_ADDRESS] = self._l2_funder_for_balance
+                        return h
+                    _l2_headers.create_level_2_headers = _l2_with_funder
+                try:
+                    return self.client.get_orders(params) or []
+                finally:
+                    if self._l2_funder_for_balance:
+                        _l2_headers.create_level_2_headers = orig_l2
+            except Exception as e:
+                err_str = str(e).lower()
+                is_retryable = "request exception" in err_str or "timeout" in err_str or "connection" in err_str
+                logger.warning("get_open_orders failed (attempt %d/3): %s", attempt + 1, e)
+                if attempt < 2 and is_retryable:
+                    time.sleep(1.0 + attempt)
+                else:
+                    return None
+        return None
 
     def _get_cached(self, cache: Dict[str, Tuple[Any, float]], key: str) -> Any:
         with self._cache_lock:
@@ -409,6 +424,93 @@ class Polymarket:
             return []
 
         return events[:limit]
+
+    def get_market_info_by_token_id(self, token_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Hittar marknadsinfo för ett token_id via Gamma API.
+        Itererar events (som innehåller markets) tills token_id matchar clobTokenIds.
+        Returnerar dict med market_id, question, groupItemTitle, outcome, end_date_iso, category, event_id.
+        """
+        import json as _json
+        token_str = str(token_id)
+        # Först: prova markets-endpoint med paginering (snabbare för aktiva marknader)
+        try:
+            for offset in range(0, 5000, 100):
+                resp = httpx.get(
+                    self.GAMMA_MARKETS_ENDPOINT,
+                    params={"active": "true", "closed": "false", "limit": "100", "offset": str(offset)},
+                    timeout=15.0,
+                )
+                if resp.status_code != 200:
+                    break
+                batch = resp.json()
+                if not isinstance(batch, list) or not batch:
+                    break
+                for m in batch:
+                    t_ids_raw = m.get("clobTokenIds")
+                    if not t_ids_raw:
+                        continue
+                    t_ids = _json.loads(t_ids_raw) if isinstance(t_ids_raw, str) else (t_ids_raw if isinstance(t_ids_raw, list) else [])
+                    if token_str not in [str(t) for t in t_ids]:
+                        continue
+                    token_idx = next((i for i, t in enumerate(t_ids) if str(t) == token_str), 0)
+                    outcomes_raw = m.get("outcomes") or "[\"Yes\", \"No\"]"
+                    outcomes = _json.loads(outcomes_raw) if isinstance(outcomes_raw, str) else (outcomes_raw or ["Yes", "No"])
+                    outcome = outcomes[token_idx] if token_idx < len(outcomes) else ("Yes" if token_idx == 0 else "No")
+                    events_arr = m.get("events") or []
+                    ev = events_arr[0] if events_arr else {}
+                    return {
+                        "market_id": str(m.get("id", "")),
+                        "question": str(m.get("question", "")),
+                        "groupItemTitle": str(m.get("groupItemTitle") or outcome),
+                        "outcome": outcome,
+                        "end_date_iso": m.get("endDate") or ev.get("endDate") or "",
+                        "category": self.extract_category(m) or self.extract_category(ev) or "Unknown",
+                        "event_id": str(ev.get("id", "")),
+                    }
+                if len(batch) < 100:
+                    break
+        except Exception as e:
+            logger.warning("get_market_info_by_token_id markets: %s", str(e)[:80])
+        # Fallback: iterera events (inkluderar stängda marknader)
+        try:
+            for offset in range(0, 3000, 100):
+                resp = httpx.get(
+                    self.GAMMA_EVENTS_ENDPOINT,
+                    params={"limit": "100", "offset": str(offset)},
+                    timeout=15.0,
+                )
+                if resp.status_code != 200:
+                    break
+                events = resp.json()
+                if not isinstance(events, list) or not events:
+                    break
+                for ev in events:
+                    for m in (ev.get("markets") or []):
+                        t_ids_raw = m.get("clobTokenIds")
+                        if not t_ids_raw:
+                            continue
+                        t_ids = _json.loads(t_ids_raw) if isinstance(t_ids_raw, str) else (t_ids_raw if isinstance(t_ids_raw, list) else [])
+                        if token_str not in [str(t) for t in t_ids]:
+                            continue
+                        token_idx = next((i for i, t in enumerate(t_ids) if str(t) == token_str), 0)
+                        outcomes_raw = m.get("outcomes") or "[\"Yes\", \"No\"]"
+                        outcomes = _json.loads(outcomes_raw) if isinstance(outcomes_raw, str) else (outcomes_raw or ["Yes", "No"])
+                        outcome = outcomes[token_idx] if token_idx < len(outcomes) else ("Yes" if token_idx == 0 else "No")
+                        return {
+                            "market_id": str(m.get("id", "")),
+                            "question": str(m.get("question", "")),
+                            "groupItemTitle": str(m.get("groupItemTitle") or outcome),
+                            "outcome": outcome,
+                            "end_date_iso": m.get("endDate") or ev.get("endDate") or "",
+                            "category": self.extract_category(ev) or self.extract_category(m) or "Unknown",
+                            "event_id": str(ev.get("id", "")),
+                        }
+                if len(events) < 100:
+                    break
+        except Exception as e:
+            logger.warning("get_market_info_by_token_id events: %s", str(e)[:80])
+        return None
 
     # --- Market data -------------------------------------------------------------
 
@@ -615,21 +717,95 @@ class Polymarket:
         print(f"⚠️ [Polymarket] Oväntat balance‑svar: {(str(data)[:80])!r}")
         return 0.0
 
+    def _get_positions_from_data_api(self) -> List[Dict[str, Any]]:
+        """
+        Hämtar positioner via Data API (kräver ingen auth).
+        Används som fallback för proxy-wallets där CLOB get_positions returnerar tomt.
+        Returnerar full metadata: asset (token_id), size, title, avgPrice, endDate, eventId, outcome, etc.
+        """
+        addr = self._l2_funder_for_balance or os.getenv("POLYMARKET_FUNDER_ADDRESS", "").strip()
+        if not addr or not addr.startswith("0x"):
+            return []
+        try:
+            resp = httpx.get(
+                self.DATA_API_POSITIONS_URL,
+                params={"user": addr, "limit": "500"},
+                timeout=15.0,
+            )
+            if resp.status_code != 200:
+                return []
+            data = resp.json()
+            return data if isinstance(data, list) else []
+        except Exception as e:
+            logger.warning("Data API positions: %s", str(e)[:80])
+            return []
+
+    def get_positions_with_metadata(self) -> List[Dict[str, Any]]:
+        """
+        Returnerar positioner med full metadata (title, avgPrice, endDate, etc.).
+        För proxy: använder Data API som har allt. För EOA: CLOB + tom metadata (kräver get_market_info_by_token_id).
+        """
+        if self._l2_funder_for_balance:
+            return self._get_positions_from_data_api()
+        positions = []
+        try:
+            raw = self.client.get_positions() or []
+            for pos in raw:
+                asset = pos.get("asset") or {}
+                tid = str(asset.get("token_id") or pos.get("token_id") or "")
+                size = float(pos.get("size") or pos.get("balance") or 0)
+                if tid:
+                    positions.append({"asset": tid, "size": size})
+        except Exception:
+            pass
+        return positions
+
     def get_all_token_balances(self) -> Dict[str, float]:
         """
         Hämtar alla positioner en gång och returnerar token_id -> balance.
-        Använd för att undvika upprepade get_positions()-anrop (t.ex. i manage_active_trades).
+        För proxy: CLOB get_positions returnerar ofta tomt – fallback till Data API.
         """
-        try:
-            positions = self.client.get_positions()
-        except Exception:
-            return {}
         out: Dict[str, float] = {}
-        for pos in positions or []:
+        positions: List[Dict[str, Any]] = []
+
+        # 1. Försök CLOB (fungerar för EOA)
+        from py_clob_client.headers import headers as _l2_headers
+        orig_l2 = _l2_headers.create_level_2_headers
+        if self._l2_funder_for_balance:
+            def _l2_with_funder(signer, creds, request_args):
+                h = orig_l2(signer, creds, request_args)
+                h[_l2_headers.POLY_ADDRESS] = self._l2_funder_for_balance
+                return h
+            _l2_headers.create_level_2_headers = _l2_with_funder
+        try:
+            positions = self.client.get_positions() or []
+        except Exception:
+            pass
+        finally:
+            if self._l2_funder_for_balance:
+                _l2_headers.create_level_2_headers = orig_l2
+
+        # 2. Fallback: Data API för proxy när CLOB returnerar tomt
+        if not positions and self._l2_funder_for_balance:
+            positions = self._get_positions_from_data_api()
+            # Data API: asset = token_id (str), size = shares
+            for pos in positions:
+                try:
+                    tid = str(pos.get("asset") or "")
+                    size = pos.get("size") or 0
+                    if tid:
+                        out[tid] = float(size)
+                except (TypeError, ValueError):
+                    continue
+            return out
+
+        for pos in positions:
             try:
-                tid = str(pos.get("token_id") or "")
+                asset = pos.get("asset") or {}
+                tid = str(asset.get("token_id") or pos.get("token_id") or "")
+                size = pos.get("size") or pos.get("balance") or 0
                 if tid:
-                    out[tid] = float(pos.get("balance") or 0)
+                    out[tid] = float(size)
             except (TypeError, ValueError):
                 continue
         return out
@@ -637,16 +813,22 @@ class Polymarket:
     def get_token_balance(self, token_id: str) -> float:
         """
         Returnerar antal shares för givet token_id.
+        För proxy använder get_all_token_balances (som har Data API-fallback).
         """
+        if self._l2_funder_for_balance:
+            return self.get_all_token_balances().get(str(token_id), 0.0)
+        from py_clob_client.headers import headers as _l2_headers
+        orig_l2 = _l2_headers.create_level_2_headers
         try:
-            positions = self.client.get_positions()
+            positions = self.client.get_positions() or []
         except Exception:
             return 0.0
-
-        for pos in positions or []:
+        for pos in positions:
             try:
-                if str(pos.get("token_id")) == str(token_id):
-                    return float(pos.get("balance") or 0)
+                asset = pos.get("asset") or {}
+                tid = str(asset.get("token_id") or pos.get("token_id") or "")
+                if tid == str(token_id):
+                    return float(pos.get("size") or pos.get("balance") or 0)
             except (TypeError, ValueError):
                 continue
         return 0.0
@@ -1145,7 +1327,7 @@ class Polymarket:
                     # Verifiera att ordern syns i CLOB (heartbeat håller den levande)
                     try:
                         open_orders = self.get_open_orders(asset_id=str(token_id))
-                        n = len(open_orders)
+                        n = len(open_orders) if open_orders else 0
                         if n > 0:
                             maker = (open_orders[0].get("maker_address") or open_orders[0].get("maker") or "?")
                             print(f"   ✓ CLOB har {n} öppen order (maker={maker[:10]}…{maker[-6:]}) – polymarket.com/portfolio?tab=open")
@@ -1179,9 +1361,10 @@ class Polymarket:
         """
         Lägger en limit‑SELL order för ett token vid givet pris.
         API: create_order(OrderArgs(token_id, price, size=shares, side=SELL), options) + post_order(..., OrderType.GTC).
+        För proxy (type 1/2): CLOB kollar balance mot POLY_ADDRESS – tokenen ligger hos funder.
+        Vi patchar POLY_ADDRESS till funder (samma som get_open_orders, get_usdc_balance) så balance-check lyckas.
         """
         try:
-            # Limit‑SELL via OrderArgs → GTC‑order som vilar i boken tills matchad.
             limit_price = float(price)
             size = float(shares)
             if limit_price <= 0 or size <= 0:
@@ -1195,7 +1378,20 @@ class Polymarket:
             )
             options = self._get_order_options(str(token_id))
             signed = self.client.create_order(order_args, options)
-            res = self.client.post_order(signed, OrderType.GTC)
+            # Proxy: patch POLY_ADDRESS till funder så CLOB kollar balance på rätt konto (token ligger hos funder).
+            from py_clob_client.headers import headers as _l2_headers
+            orig_l2 = _l2_headers.create_level_2_headers
+            if self._l2_funder_for_balance:
+                def _l2_with_funder(signer, creds, request_args):
+                    h = orig_l2(signer, creds, request_args)
+                    h[_l2_headers.POLY_ADDRESS] = self._l2_funder_for_balance
+                    return h
+                _l2_headers.create_level_2_headers = _l2_with_funder
+            try:
+                res = self.client.post_order(signed, OrderType.GTC)
+            finally:
+                if self._l2_funder_for_balance:
+                    _l2_headers.create_level_2_headers = orig_l2
             if not res:
                 logger.warning("execute_sell_order: post_order returned empty for token %s", token_id)
                 return False
@@ -1206,6 +1402,16 @@ class Polymarket:
                 return False
             return True
         except Exception as e:
+            err_str = str(e).lower()
+            # Orphan: endast när vi INTE använder proxy. Med proxy ger POLY_ADDRESS=EOA "not enough balance"
+            # pga token ligger hos funder – då ska vi INTE markera som orphan.
+            if not self._l2_funder_for_balance and ("not enough balance" in err_str or "allowance" in err_str):
+                raise OrphanPositionError(f"Token {token_id}: {e}") from e
+            if self._l2_funder_for_balance and ("not enough balance" in err_str or "allowance" in err_str):
+                logger.warning(
+                    "execute_sell_order: proxy – lägg GTC-sälj manuellt på polymarket.com"
+                )
+                return False  # Ingen traceback för känt proxy-fel
             logger.exception("execute_sell_order failed for token %s at %.3f: %s", token_id, float(price), str(e)[:100])
             return False
 

@@ -4,11 +4,13 @@ import time
 import json
 import math
 import queue
+import threading
 import traceback
 import warnings
 import datetime as dt
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Dict, List
 from dotenv import load_dotenv, find_dotenv
 
 # --- PATH FIX ---
@@ -25,9 +27,35 @@ warnings.filterwarnings("ignore", message=".*was never awaited", category=Runtim
 from agents.db_manager import DatabaseManager
 from agents.war_room import MagnusWarRoom
 from agents.risk_manager import RiskManager
-from agents.polymarket.polymarket import Polymarket
+from agents.polymarket.polymarket import Polymarket, OrphanPositionError
 from agents.observer import MagnusObserver
 from agents.application.scanner import MarketScanner
+
+
+class StopLossMonitor(threading.Thread):
+    """
+    Dedikerad tråd som kör manage_active_trades var N:e sekund – oberoende av War Room.
+    Säkerställer att stop-loss triggas även under långa analyser (2–5 min per batch).
+    """
+    def __init__(self, trade_manager, interval_seconds: int = 30, daemon: bool = True):
+        super().__init__(daemon=daemon)
+        self.trade_manager = trade_manager
+        self.interval = max(15, min(interval_seconds, 300))  # 15s–5min
+        self._stop = threading.Event()
+
+    def stop(self):
+        self._stop.set()
+
+    def run(self):
+        while not self._stop.is_set():
+            if self._stop.wait(timeout=self.interval):
+                break
+            try:
+                self.trade_manager.manage_active_trades()
+            except Exception as e:
+                logger.warning("StopLossMonitor: %s", str(e)[:100])
+
+
 from agents.logging_config import setup_logging
 from agents.portfolio_risk import PortfolioRiskManager
 from agents.dynamic_target import compute_dynamic_target
@@ -36,6 +64,10 @@ import logging
 logger = logging.getLogger("magnus.trade")
 setup_logging()
 
+# Pending GTC buys som inte fylldes inom 36s – sparas för orphan-fill recovery
+PENDING_GTC_FILE = root_path / ".magnus_pending_gtc.json"
+PENDING_GTC_MAX_AGE_HOURS = 48
+
 class Trade:
     def __init__(self) -> None:
         self.db = DatabaseManager()
@@ -43,15 +75,16 @@ class Trade:
         self.risk = RiskManager()
         self.polymarket = Polymarket()
         self.portfolio_risk = PortfolioRiskManager(self.db, self.polymarket)
+        self._manage_trades_lock = threading.Lock()
         
         # Core: buy cheap, sell high. Only buy when price < our value.
         self.profit_target = 0.07       # Baseline 7%; raised to 10% for cheap buys
         self.profit_target_high = 0.10  # Used when fill < price_high_threshold
         self.price_high_threshold = 0.30  # If fill < 0.30 use profit_target_high (larger upside)
         try:
-            self.min_edge_to_enter = float(os.getenv("MAGNUS_MIN_EDGE", "0.018"))
+            self.min_edge_to_enter = float(os.getenv("MAGNUS_MIN_EDGE", "0.025"))
         except ValueError:
-            self.min_edge_to_enter = 0.018  # ~1.8 cent – fler köp; sätt 0.025 för strängare
+            self.min_edge_to_enter = 0.025  # Minst 2.5 cent edge – undvik köp högt
         self.max_open_positions = 15
         self.max_bet_usdc = 100.0       # Smaller bets for diversification
         # Polymarket krav: minst $1 per köp, och minst 5 andelar för att kunna sälja (sälj-minimum 5)
@@ -91,6 +124,12 @@ class Trade:
         self.skip_title_patterns = [("elon musk", "tweet")]
         if os.getenv("MAGNUS_SKIP_BITCOIN", "0").strip().lower() in ("1", "true", "yes"):
             self.skip_title_patterns.append(("bitcoin", None))
+        # Manipulation-suspekt: titlar som ofta associeras med pump/dump eller koordinerad aktivitet.
+        self.manipulation_title_patterns = [
+            ("pump", "dump"), ("100x", None), ("1000x", None), ("moon", "shot"),
+            ("viral", "challenge"), ("elon", "tweet"), ("sbf", None), ("ftx", None),
+        ]
+        self.skip_manipulation_suspect = os.getenv("MAGNUS_SKIP_MANIPULATION_SUSPECT", "1").strip().lower() in ("1", "true", "yes")
         # 0 = köp även om pris inte är under snitt (rekommenderat så Quant-BUY faktiskt blir köp)
         self.require_below_avg = os.getenv("MAGNUS_REQUIRE_BELOW_AVG", "0").strip().lower() not in ("0", "false", "no")
         self.allow_at_avg_if_hype_min = 6   # If hype_score >= this, allow buy at "near avg" too (0 = off)
@@ -128,6 +167,8 @@ class Trade:
             self.allow_retrade_after_days = 0
         # Default 1: skippa Bouncer i scannern – alla som passerar pre-filters går till kön (Lawyer+Quant filtrerar). Sätt 0 för att köra Bouncer.
         self.skip_bouncer_in_scanner = os.getenv("MAGNUS_SKIP_BOUNCER_IN_SCANNER", "1").strip().lower() in ("1", "true", "yes")
+        # Default 1: Sport – max 1 position per match (titel-dedup). Sätt MAGNUS_SPORTS_TITLE_DEDUP=0 för att tillåta flera.
+        self.sports_title_dedup = os.getenv("MAGNUS_SPORTS_TITLE_DEDUP", "1").strip().lower() not in ("0", "false", "no")
         # Min hold time before stop-loss activates (hours)
         try:
             self.min_hold_hours_before_sl = float(os.getenv("MAGNUS_MIN_HOLD_HOURS", "2.0"))
@@ -204,12 +245,14 @@ class Trade:
         mid = (high + low) / 2 if (high or low) else 0
         in_lower_half = (mid > 0 and p <= mid) or (low > 0 and p <= low * 1.08)
         near_historical_low = low > 0 and p <= low * 1.05
+        near_historical_high = high > 0 and p >= high * 0.92  # Inom 8% av topp = köp högt
         range_pct = round((high - low) / avg * 100, 1) if avg > 0 and (high - low) > 0 else 0
 
         price_context = {
             "price_vs_avg": price_vs_avg,
             "in_lower_half": in_lower_half,
             "near_historical_low": near_historical_low,
+            "near_historical_high": near_historical_high,
             "range_pct": range_pct,
             "high": high,
             "low": low,
@@ -269,41 +312,149 @@ class Trade:
         }
         return potential, meta
 
-    def manage_active_trades(self):
-        """Manage closing of finished trades. Sync observer to DB."""
+    def _load_pending_gtc(self) -> dict:
+        """Ladda pending GTC-orders från fil."""
         try:
+            if PENDING_GTC_FILE.exists():
+                with open(PENDING_GTC_FILE, encoding="utf-8") as f:
+                    data = json.load(f)
+                    if isinstance(data, dict):
+                        return data
+        except Exception as e:
+            logger.warning("_load_pending_gtc: %s", str(e)[:80])
+        return {}
+
+    def _save_pending_gtc(self, pending: dict) -> None:
+        """Spara pending GTC till fil."""
+        try:
+            with open(PENDING_GTC_FILE, "w", encoding="utf-8") as f:
+                json.dump(pending, f, indent=0)
+        except Exception as e:
+            logger.warning("_save_pending_gtc: %s", str(e)[:80])
+
+    def _recover_orphan_fills(self, positions_map: dict) -> None:
+        """Upptäck GTC-fills som fylldes efter att vi lämnat poll – logga till DB och lägg GTC-sälj."""
+        pending = self._load_pending_gtc()
+        if not pending:
+            return
+        open_token_ids = {str(t["token_id"]) for t in self.db.get_open_positions()}
+        now = time.time()
+        recovered = 0
+        for t_id, bal in positions_map.items():
+            if bal < 5.0 or t_id in open_token_ids:
+                continue
+            p = pending.get(str(t_id))
+            if not p or not isinstance(p, dict):
+                continue
+            ts = p.get("timestamp", 0)
+            if now - ts > PENDING_GTC_MAX_AGE_HOURS * 3600:
+                continue
+            try:
+                buy_price = float(p.get("limit_price") or p.get("amount_usdc", 0) / max(1, bal))
+                target_price = compute_dynamic_target(
+                    fill_price=buy_price,
+                    days_until_end=p.get("days_until_end"),
+                    range_pct=float(p.get("range_pct") or 0),
+                    hype_score=int(p.get("hype_score") or 0),
+                    spread_pct=p.get("spread_pct"),
+                    ai_max_price=float(p.get("ai_max_price") or 0.99),
+                    base_target_pct=self.profit_target,
+                    high_target_pct=self.profit_target_high,
+                    price_high_threshold=self.price_high_threshold,
+                )
+                self.db.log_new_trade(
+                    token_id=t_id,
+                    market_id=p.get("market_id", ""),
+                    question=p.get("question", "Orphan fill"),
+                    buy_price=buy_price,
+                    amount_usdc=float(p.get("amount_usdc") or 0),
+                    shares_bought=float(bal),
+                    notes="Orphan fill (GTC filled after poll)",
+                    category=p.get("category", ""),
+                    spread_pct=p.get("spread_pct"),
+                    target_price=target_price,
+                    end_date_iso=p.get("end_date_iso") or "",
+                    event_id=p.get("event_id"),
+                )
+                ok = self.polymarket.execute_sell_order(t_id, bal, target_price)
+                if ok:
+                    print(f"\n📥 Orphan fill recovered: {p.get('question', t_id)[:35]}… @ {buy_price:.2f} → GTC sell {target_price:.2f}")
+                if self.active_observer:
+                    self.active_observer.add_token(t_id, buy_price, p.get("question", ""), target_price=target_price)
+                del pending[t_id]
+                recovered += 1
+            except Exception as e:
+                logger.warning("Orphan recover %s: %s", t_id, str(e)[:80])
+        if recovered:
+            self._save_pending_gtc(pending)
+        elif pending:
+            # Rensa utgångna
+            cleaned = {k: v for k, v in pending.items() if now - (v.get("timestamp") or 0) <= PENDING_GTC_MAX_AGE_HOURS * 3600}
+            if len(cleaned) != len(pending):
+                self._save_pending_gtc(cleaned)
+
+    def manage_active_trades(self):
+        """Manage closing of finished trades. Sync observer to DB. Thread-safe."""
+        with self._manage_trades_lock:
+            self._manage_active_trades_impl()
+
+    def _manage_active_trades_impl(self):
+        """Intern implementation – anropas under lock."""
+        try:
+            positions_map = self.polymarket.get_all_token_balances()
+            self._recover_orphan_fills(positions_map)
+
             trades = self.db.get_open_positions()
             if self.active_observer:
                 self.active_observer.sync_from_db()
             if not trades:
                 return
 
-            print(f"🧹 Verifying {len(trades)} positions on-chain...")
-            # En anrop för alla positioner istället för N anrop (get_positions per token).
-            positions_map = self.polymarket.get_all_token_balances()
+            # Batch: hämta alla öppna ordrar en gång (1 API-anrop istället för N)
+            all_open_orders = self.polymarket.get_open_orders()
+            orders_by_token: Dict[str, List] = {}
+            if all_open_orders is not None:
+                raw = all_open_orders.get("data", all_open_orders) if isinstance(all_open_orders, dict) else (all_open_orders or [])
+                for o in (raw if isinstance(raw, list) else []):
+                    aid = str(
+                        (o.get("asset_id") or o.get("assetId") or o.get("token_id"))
+                        if isinstance(o, dict)
+                        else (getattr(o, "asset_id", None) or getattr(o, "assetId", None) or getattr(o, "token_id", None))
+                        or ""
+                    )
+                    if aid:
+                        orders_by_token.setdefault(aid, []).append(o)
             for i, t in enumerate(trades):
                 t_id = t['token_id']
-                sys.stdout.write(f"\r   [{i+1}/{len(trades)}] Checking: {t['question'][:30]}...")
-                sys.stdout.flush()
 
                 actual_balance = positions_map.get(str(t_id), 0.0)
                 target_price = float(t.get('target_price') or 0)
                 # Saknad GTC-sälj: om vi har andelar men ingen säljorder, lägg en
                 if actual_balance >= 5.0 and target_price >= 0.01:
                     try:
-                        open_orders = self.polymarket.get_open_orders(asset_id=str(t_id))
-                        orders_list = open_orders.get("data", open_orders) if isinstance(open_orders, dict) else (open_orders or [])
+                        if all_open_orders is None:
+                            continue  # API-fel – skippa placement, undvik dubbletter
+                        orders_list = orders_by_token.get(str(t_id), [])
                         has_sell = any(
                             str(getattr(o, "side", o.get("side", "") if isinstance(o, dict) else "")).upper() == "SELL"
-                            for o in (orders_list if isinstance(orders_list, list) else [])
+                            for o in orders_list
                         )
-                        if not has_sell:
+                        if not has_sell and t.get('order_active_in_book') != 1:
                             print(f"\n📤 Saknad GTC-sälj – lägger target {target_price:.2f} för {t['question'][:35]}…")
-                            ok = self.polymarket.execute_sell_order(t_id, actual_balance, target_price)
-                            if ok:
-                                print(f"   ✓ GTC sell order placerad.")
-                            else:
-                                print(f"   ⚠️ GTC sell misslyckades – se logg.")
+                            try:
+                                ok = self.polymarket.execute_sell_order(t_id, actual_balance, target_price)
+                                if ok:
+                                    print(f"   ✓ GTC sell order placerad.")
+                                else:
+                                    print(f"   ⚠️ GTC sell misslyckades – kör: python -m scripts.python.cli restore-sell-orders")
+                            except Exception as orphan_err:
+                                if isinstance(orphan_err, OrphanPositionError):
+                                    self.db.update_trade_status(t_id, "CLOSED_ORPHAN", "Sell failed: not enough balance (orphan)")
+                                    if self.active_observer:
+                                        self.active_observer.remove_token(t_id)
+                                    print(f"\n   🧹 Orphan: {t['question'][:30]} – stängd (saknad balance på CLOB)")
+                                    continue
+                                raise
                     except Exception as e:
                         logger.warning("Saknad GTC-sälj check failed for %s: %s", t_id, str(e)[:80])
                 if actual_balance < 0.01:
@@ -334,41 +485,27 @@ class Trade:
                 current_ask = float(ask) if ask is not None else (self.polymarket.get_buy_price(t_id) if actual_balance >= 5.0 else 0)
                 price_for_sell_check = current_bid if current_bid is not None and current_bid > 0 else (current_ask if isinstance(current_ask, (int, float)) and current_ask > 0 else None)
 
-                # Stop-loss: if bid < buy - stop_loss_pct, place sell at stop level
+                # Stop-loss: if bid < buy - stop_loss_pct, sell at bid (not threshold) to get filled
                 young_trade = trade_age_hours is not None and trade_age_hours < self.min_hold_hours_before_sl
                 if self.stop_loss_pct > 0 and buy_price > 0 and actual_balance >= 5.0 and price_for_sell_check is not None and not young_trade:
                     try:
                         threshold = buy_price * (1 - self.stop_loss_pct)
                         if price_for_sell_check < threshold:
-                            stop_price = round(threshold, 3)
+                            # Sälj vid bid (minus 1 cent) – annars fylls inte vid limit vid threshold
+                            stop_price = max(0.01, round(price_for_sell_check - 0.01, 3))
                             if stop_price >= 0.01:
-                                print(f"\n🛑 Stop-loss: {t['question'][:35]}… at {stop_price:.2f} (bid {price_for_sell_check:.3f} < threshold {threshold:.3f})")
+                                print(f"\n🛑 Stop-loss: {t['question'][:35]}… selling at {stop_price:.2f} (bid {price_for_sell_check:.3f} < threshold {threshold:.3f})")
                                 ok = self.polymarket.execute_sell_order(t_id, actual_balance, stop_price)
                                 if ok:
                                     self.db.update_trade_status(t_id, "CLOSED_LOSS", f"Stop-loss at {stop_price:.3f}")
                     except Exception:
                         pass
 
-                # Time-based exit: if < 2 days left and price flat, sell at break-even
+                # Ingen time-based exit – vi säljer endast vid target (vinst) eller stop-loss.
+                # Köp för X, sälj för dyrare. GTC vid target_price väntar tills någon köper.
+
                 end_date_iso = (t.get("end_date_iso") or "").strip()
                 _ask = current_ask if isinstance(current_ask, (int, float)) else 0
-                if end_date_iso and buy_price > 0 and actual_balance >= 5.0 and _ask > 0:
-                    try:
-                        end_str = end_date_iso.replace("Z", "+00:00")
-                        if "+" not in end_str and not end_str.endswith("00:00"):
-                            end_str = end_str + "+00:00"
-                        end_dt = dt.datetime.fromisoformat(end_str)
-                        if end_dt.tzinfo is None:
-                            end_dt = end_dt.replace(tzinfo=dt.timezone.utc)
-                        delta = end_dt - dt.datetime.now(dt.timezone.utc)
-                        days_until_end = max(0, delta.total_seconds() / 86400)
-                        if days_until_end < 2 and _ask < buy_price * 1.02:
-                            be_price = round(buy_price + 0.01, 3)
-                            be_price = min(be_price, 0.99)
-                            print(f"\n⏱️ Time-based exit (< 2d left, price below buy+2%): {t['question'][:35]}… selling at {be_price:.2f}")
-                            self.polymarket.execute_sell_order(t_id, actual_balance, be_price)
-                    except Exception:
-                        pass
 
                 # Shadow mode: simulate smarter exit (no actual orders)
                 if self.exit_shadow_mode and buy_price > 0 and actual_balance >= 5.0:
@@ -403,6 +540,20 @@ class Trade:
         trades = self.db.get_open_positions()
         return any(str(t['market_id']) == str(market_id) for t in trades)
 
+    def _is_manipulation_suspect(self, title: str) -> bool:
+        """True om titeln matchar manipulation-suspekta mönster (pump/dump, viral challenge, etc)."""
+        if not self.skip_manipulation_suspect or not title:
+            return False
+        t = title.lower()
+        for p1, p2 in getattr(self, "manipulation_title_patterns", []):
+            if p2 is None:
+                if p1 in t:
+                    return True
+            else:
+                if p1 in t and p2 in t:
+                    return True
+        return False
+
     def _allow_market_scan(self, market_id: str) -> bool:
         """True om marknaden ska få komma in i scannern. Blockerar bara om vi har öppen position (already_owns).
         Tidigare handlade marknader får komma in igen så att analyspoolen inte krymper; allow_retrade_after_days
@@ -436,6 +587,22 @@ class Trade:
                 return False  # Others: max N per event
         return True
 
+    def _has_similar_sports_position(self, question: str, category: str) -> bool:
+        """True om vi redan har position i samma match (titel-prefix). Fångar fall där event_id skiljer sig."""
+        if (category or "").strip() != "Sports" or not question:
+            return False
+        # Extrahera match-prefix: "Agamenone vs. Ouden: Set 1..." → "agamenone vs. ouden"
+        def _key(q):
+            return ((q or "").split(":")[0] or q).strip()[:30].lower()
+        new_key = _key(question)
+        if len(new_key) < 12 or " vs" not in new_key:
+            return False
+        for t in self.db.get_open_positions():
+            existing = _key(t.get("question") or "")
+            if existing and new_key[:20] == existing[:20]:
+                return True
+        return False
+
     def run_sniper_loop(self):
         print("🚀 Magnus V4 Sniper Mode [WAR ROOM ACTIVE]...")
 
@@ -465,6 +632,15 @@ class Trade:
         # 1b. CLOB heartbeat – utan detta avbryts GTC-ordrar inom ~10s (Polymarket krav)
         self.polymarket.start_heartbeat()
 
+        # 1c. Stop-loss monitor – kör manage_active_trades var 30:e sekund oberoende av War Room
+        try:
+            sl_interval = int(os.getenv("MAGNUS_STOP_LOSS_INTERVAL_SECONDS", "30"))
+        except ValueError:
+            sl_interval = 30
+        self.stop_loss_monitor = StopLossMonitor(self, interval_seconds=sl_interval)
+        self.stop_loss_monitor.start()
+        print(f"🛑 Stop-loss monitor started (interval {sl_interval}s).")
+
         # 2. Scanner queue (Bouncer in scanner – only PASS in queue)
         candidate_queue = queue.Queue(maxsize=500)
         # Scan cadence and dedup TTL can be tuned via env
@@ -477,11 +653,11 @@ class Trade:
         except ValueError:
             dedup_ttl = 3600
         try:
-            event_limit = int(os.getenv("MAGNUS_SCANNER_EVENT_LIMIT", "2500"))  # events per strategy; höj för fler kandidater
+            event_limit = int(os.getenv("MAGNUS_SCANNER_EVENT_LIMIT", "4000"))  # events per strategy; höj för fler kandidater
         except ValueError:
-            event_limit = 2500
+            event_limit = 4000
         _strat_env = os.getenv("MAGNUS_SCANNER_STRATEGIES", "").strip()
-        strategies = [s.strip() for s in _strat_env.split(",") if s.strip()] if _strat_env else ["liquid", "undiscovered", "new"]
+        strategies = [s.strip() for s in _strat_env.split(",") if s.strip()] if _strat_env else ["liquid", "undiscovered", "new", "trending", "featured"]
         scanner = MarketScanner(
             candidate_queue,
             self,
@@ -517,6 +693,10 @@ class Trade:
                 def run_batch(batch_list, balance, skip_bouncer=False):
                     """Run War Room for batch; returns (new_balance, skip_rest). skip_bouncer=True for scanner candidates."""
                     skip_rest = False
+                    # Filtrera bort manipulation-suspekta innan War Room (sparar AI-tokens)
+                    batch_list = [c for c in batch_list if not self._is_manipulation_suspect(c.get("full_title") or "")]
+                    if not batch_list:
+                        return (balance, skip_rest)
                     payloads = [c["market_for_ai"] for c in batch_list]
                     def _process_one(c, raw, bal, skip):
                         """Bearbeta ett War Room-resultat; returnerar (ny_balance, ny_skip_rest)."""
@@ -655,6 +835,12 @@ class Trade:
                                     print(f"   ⏸️ {msg}")
                                     self._log_to_live(f"⏸️ {msg}")
                                 return (bal, skip)
+                            # Sport: undvik flera positioner i samma match även om event_id skiljer sig (MAGNUS_SPORTS_TITLE_DEDUP=1)
+                            if self.sports_title_dedup and self._has_similar_sports_position(full_title, e_category):
+                                msg = "Already have position in this match (Sports title dedup). Skipping buy."
+                                print(f"   ⏸️ {msg}")
+                                self._log_to_live(f"⏸️ {msg}")
+                                return (bal, skip)
                             if self.portfolio_risk.check_correlation(full_title, e_category):
                                 msg = f"Too many correlated positions in {e_category}. Skipping buy."
                                 print(f"   ⏸️ {msg}")
@@ -704,6 +890,13 @@ class Trade:
                                     self._log_to_live(f"⏸️ {msg}")
                                     return (bal, skip)
                             ai_max_price = float(decision.get('max_price', 0.0) or 0.0)
+                            # Blockera köp vid topp – vi köper aldrig högt
+                            near_high = bool(price_context.get("near_historical_high"))
+                            if near_high:
+                                msg = "Skipping buy: price near historical high (köp högt = sälj lågt)."
+                                print(f"   ⏸️ {msg}")
+                                self._log_to_live(f"⏸️ {msg}")
+                                return (bal, skip)
                             # Måste finnas utrymme för vinst inkl. avgifter. MAGNUS_MAX_BUY_PRICE (default 0.6) = max 40¢/andel.
                             try:
                                 max_buy = float(os.getenv("MAGNUS_MAX_BUY_PRICE", "0.6"))
@@ -751,10 +944,16 @@ class Trade:
                                     return (bal, skip)
                                 # Säkerställ att förväntad brutto‑profit i USDC är värd avgifter och risk.
                                 edge_per_share = max(0.0, ai_max_price - price_now)
+                                min_edge = getattr(self, "min_edge_to_enter", 0.025)
                                 if edge_per_share <= 0:
                                     msg = f"Expected edge per share ≤ 0 (max {ai_max_price:.3f} vs price {price_now:.3f}). Skipping."
                                     print(f"   ⚠️ {msg}")
                                     self._log_to_live(f"⚠️ {msg}")
+                                    return (bal, skip)
+                                if edge_per_share < min_edge:
+                                    msg = f"Edge {edge_per_share:.3f} < min {min_edge:.3f} – för smal marginal, risk för köp högt. Skipping."
+                                    print(f"   ⏸️ {msg}")
+                                    self._log_to_live(f"⏸️ {msg}")
                                     return (bal, skip)
                                 est_shares = bet / price_now if price_now > 0 else 0.0
                                 est_gross_profit = edge_per_share * est_shares
@@ -835,15 +1034,11 @@ class Trade:
                                         actual_shares = self.polymarket.get_token_balance(token_id)
                                     actual_fill_price = round(bet / actual_shares, 3) if actual_shares and actual_shares > 0 else price_now
                                     if actual_shares and actual_shares >= 5.0:
-                                        print(f"✅ Buy complete! Receipt: #{order_id} | Fill: {actual_fill_price:.3f} (shares: {actual_shares:.2f})")
-                                    else:
-                                        print(f"📋 Order placed (GTC). Receipt: #{order_id} | Shares: {(actual_shares or 0):.2f} – order på boken, väntar på fill. Inte loggat till DB.")
-                                    # Logga endast till DB när vi faktiskt har andelar (undvik phantom)
-                                    if actual_shares and actual_shares >= 5.0:
+                                        # Beräkna target direkt så användaren ser det (viktigt vid manuellt GTC-sälj med proxy)
                                         _d_end = c.get("market_for_ai", {}).get("days_until_end")
                                         _r_pct = price_context.get("range_pct", 0)
                                         _hype = int(decision.get("hype_score") or 0)
-                                        target_price = compute_dynamic_target(
+                                        _target = compute_dynamic_target(
                                             fill_price=actual_fill_price,
                                             days_until_end=_d_end,
                                             range_pct=_r_pct,
@@ -854,6 +1049,30 @@ class Trade:
                                             high_target_pct=self.profit_target_high,
                                             price_high_threshold=self.price_high_threshold,
                                         )
+                                        print(f"✅ Buy complete! Receipt: #{order_id} | Fill: {actual_fill_price:.3f} (shares: {actual_shares:.2f}) | Target: {_target:.2f}")
+                                    else:
+                                        print(f"📋 Order placed (GTC). Receipt: #{order_id} | Shares: {(actual_shares or 0):.2f} – order på boken, väntar på fill. Inte loggat till DB.")
+                                        # Spara till pending så manage_active_trades kan upptäcka fill senare
+                                        pending = self._load_pending_gtc()
+                                        pending[str(token_id)] = {
+                                            "limit_price": price_now,
+                                            "amount_usdc": bet,
+                                            "market_id": m_id,
+                                            "question": full_title,
+                                            "category": e_category,
+                                            "end_date_iso": end_date_str or "",
+                                            "event_id": event_id,
+                                            "spread_pct": spread_pct,
+                                            "ai_max_price": ai_max_price,
+                                            "days_until_end": c.get("market_for_ai", {}).get("days_until_end"),
+                                            "range_pct": price_context.get("range_pct", 0),
+                                            "hype_score": int(decision.get("hype_score") or 0),
+                                            "timestamp": int(time.time()),
+                                        }
+                                        self._save_pending_gtc(pending)
+                                    # Logga endast till DB när vi faktiskt har andelar (undvik phantom)
+                                    if actual_shares and actual_shares >= 5.0:
+                                        target_price = _target
                                         self.db.log_new_trade(
                                             token_id=token_id, market_id=m_id, question=full_title, buy_price=actual_fill_price,
                                             amount_usdc=bet, shares_bought=actual_shares, notes=decision.get('reason', 'Buy approved'),
@@ -868,7 +1087,7 @@ class Trade:
                                         if sell_ok:
                                             print(f"   📤 GTC sell order active: {target_price:.2f}")
                                         else:
-                                            print(f"   ⚠️ GTC sell order failed – run restore_sell_orders.py at {target_price:.2f}")
+                                            print(f"   ⚠️ GTC sell order failed – kör: python -m scripts.python.cli restore-sell-orders")
                                         if self.active_observer:
                                             self.active_observer.add_token(token_id, actual_fill_price, full_title, target_price=target_price)
                                             print(f"📡 WebSocket monitoring active.")

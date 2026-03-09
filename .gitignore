@@ -11,6 +11,7 @@ __pycache__/
 .env.*
 !.env.example
 .magnus_pulse
+.magnus_pending_gtc.json
 
 # Logs & data
 *.log
