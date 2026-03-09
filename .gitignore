@@ -32,6 +32,7 @@ dist/
 .cursorrules
 
 # Archives
+docs/
 docs_build/
 site_build/
 docs.zip
