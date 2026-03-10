@@ -6,7 +6,7 @@ __pycache__/
 .vscode/
 .DS_Store
 
-# Local config / secrets – ALDRIG committa
+# Local config / secrets – NEVER commit
 .env
 .env.*
 !.env.example

@@ -48,9 +48,9 @@ class MarketScanner(threading.Thread):
         self.sleep_between_rounds = sleep_between_rounds_seconds
         self._dedup: Dict[Tuple[str, str], float] = {}
         self._stop = threading.Event()
-        # Verbos logg (en 🔍‑rad per event) kan slås på med MAGNUS_VERBOSE_SCANNER=1.
+        # Verbose log (one 🔍 line per event) can be enabled with MAGNUS_VERBOSE_SCANNER=1.
         self.verbose = os.getenv("MAGNUS_VERBOSE_SCANNER", "0").strip().lower() in ("1", "true", "yes")
-        # Relaxed mode: släpp igenom fler kandidater till War Room (mjukare krav på likviditet och tid kvar).
+        # Relaxed mode: let more candidates through to War Room (softer liquidity and time-left requirements).
         self.relaxed_filters = os.getenv("MAGNUS_RELAX_SCANNER_FILTERS", "1").strip().lower() in ("1", "true", "yes")
 
     def stop(self):
@@ -74,7 +74,7 @@ class MarketScanner(threading.Thread):
         self._dedup[(str(m_id), str(token_id))] = time.time()
 
     def _build_event_markets_overview(self, markets: list, event_title: str) -> list:
-        """Get price (and spread) for all markets in event. Använder Gamma outcomePrices (0–1, som webben) när tillgängligt, annars CLOB."""
+        """Get price (and spread) for all markets in event. Uses Gamma outcomePrices (0–1, like web) when available, else CLOB."""
         overview = []
         for market_data in markets:
             m_id = str(market_data.get("id"))
@@ -174,7 +174,7 @@ class MarketScanner(threading.Thread):
             from agents.polymarket.polymarket import Polymarket
             for ev in events:
                 raw_cat = ev.get("category")
-                # Gamma kan returnera en lista med taggar som "category" – normalisera till label.
+                # Gamma can return a list of tags as "category" – normalise to label.
                 if not isinstance(raw_cat, str) or raw_cat in ("", "Unknown"):
                     ev["category"] = Polymarket.extract_category(ev)
 
@@ -182,7 +182,7 @@ class MarketScanner(threading.Thread):
             events.sort(key=lambda e: 0 if e.get("category", "") in preferred else 1)
 
             n_events = len(events)
-            print(f"\n📡 SCANNER ({strategy}): {n_events} events – bearbetar…", flush=True)
+            print(f"\n📡 SCANNER ({strategy}): {n_events} events – processing…", flush=True)
             enqueued_this_round = 0
             to_bouncer = 0
             bouncer_pass_count = 0
@@ -209,12 +209,12 @@ class MarketScanner(threading.Thread):
                     markets = event.get("markets", [])
                     if not markets:
                         continue
-                    # Minsta rensning på event‑nivå: skippa "up or down"-brus och manipulation-suspekta titlar.
+                    # Minimal cleanup at event level: skip "up or down" noise and manipulation-suspect titles.
                     if "up or down" in e_title.lower():
                         continue
                     if self.trade._is_manipulation_suspect(e_title):
                         continue
-                    # Volume/liquidity: hög volym men tunn orderbook = misstänkt wash trading.
+                    # Volume/liquidity: high volume but thin orderbook = suspected wash trading.
                     if self.trade.skip_manipulation_suspect:
                         vol = event.get("volume24hr") or event.get("volume_24hr") or 0
                         liq = event.get("liquidity") or 0
@@ -225,7 +225,7 @@ class MarketScanner(threading.Thread):
                         except (TypeError, ValueError):
                             pass
 
-                    # Håll loggen ren: standard = ingen per‑event‑rad. Sätt MAGNUS_VERBOSE_SCANNER=1 för att visa.
+                    # Keep log clean: default = no per-event line. Set MAGNUS_VERBOSE_SCANNER=1 to show.
                     if self.verbose:
                         cat_tag = f"[{e_category}]" if e_category and e_category != "Unknown" else ""
                         print(f"   🔍 {cat_tag} {e_title[:70]}")
@@ -296,7 +296,7 @@ class MarketScanner(threading.Thread):
                                         print(f"      [price skip] raw={current_price} (min={min_p}, max={max_p})", flush=True)
                                     continue
                                 # Liquidity filter: thin orderbook → hard to sell without slippage.
-                                # I relaxed-läge: tillåt allt med någon budlikviditet (> 0); annars använd konfigurerad gräns.
+                                # In relaxed mode: allow all with some bid liquidity (> 0); else use configured limit.
                                 if self.relaxed_filters:
                                     if bid_liquidity <= 0:
                                         skip_liquidity += 1
@@ -305,7 +305,7 @@ class MarketScanner(threading.Thread):
                                     if bid_liquidity < self.trade.min_bid_liquidity_usdc:
                                         skip_liquidity += 1
                                         continue
-                                # Spread: Quant REJECT:ar nästan alltid vid >15–25%; filtrera tidigt så vi sparar War Room-anrop
+                                # Spread: Quant almost always REJECTs at >15–25%; filter early to save War Room calls
                                 max_spread = getattr(self.trade, "max_spread_pct", 95.0)
                                 if spread_pct is not None and spread_pct > max_spread:
                                     skip_spread += 1
@@ -317,7 +317,7 @@ class MarketScanner(threading.Thread):
                                 days_until_end, price_context = self.trade._price_and_time_context(
                                     current_price, stats, end_date_str
                                 )
-                                # Time left – något mjukare så fler når Bouncer/Quant
+                                # Time left – slightly softer so more reach Bouncer/Quant
                                 e_title_lower = e_title.lower()
                                 is_price_event = any(
                                     kw in e_title_lower
@@ -328,7 +328,7 @@ class MarketScanner(threading.Thread):
                                     min_days = 1.2
                                 elif e_category in self.trade.high_risk_categories:
                                     min_days = 1.0
-                                # I relaxed-läge: släpp igenom fler – minst ~0.08 dagar (~2h); annars 0.2 dagar.
+                                # In relaxed mode: let more through – min ~0.08 days (~2h); else 0.2 days.
                                 if days_until_end is not None:
                                     if self.relaxed_filters:
                                         min_days_relaxed = 0.08
@@ -347,7 +347,7 @@ class MarketScanner(threading.Thread):
                                 if range_pct < self.trade.min_range_pct:
                                     skip_range += 1
                                     continue
-                                # Price‑zon: konfigurerbar; av med MAGNUS_SCANNER_REF_PRICE_FILTER=0 för max antal kandidater.
+                                # Price zone: configurable; set MAGNUS_SCANNER_REF_PRICE_FILTER=0 for max candidates.
                                 ref_price_filter_on = os.getenv("MAGNUS_SCANNER_REF_PRICE_FILTER", "1").strip().lower() in ("1", "true", "yes")
                                 if ref_price_filter_on:
                                     avg_price = float(stats.get("avg") or 0.0)
@@ -407,7 +407,7 @@ class MarketScanner(threading.Thread):
                                     "event_id": event_id,
                                 }
 
-                                # Ask-likviditet: FOK kräver att någon säljer. Konfigurerbar via MAGNUS_MIN_ASK_MULTIPLIER.
+                                # Ask liquidity: FOK requires someone to sell. Configurable via MAGNUS_MIN_ASK_MULTIPLIER.
                                 ask_liq, best_ask = self.trade.polymarket._get_ask_liquidity_usdc(token_id)
                                 try:
                                     ask_mult = float(os.getenv("MAGNUS_MIN_ASK_MULTIPLIER", "0.5"))
@@ -417,7 +417,7 @@ class MarketScanner(threading.Thread):
                                 if ask_liq < min_ask_usdc:
                                     skip_ask_liq += 1
                                     continue
-                                # Bouncer (Option A): only PASS candidates go to queue (kan stängas av med MAGNUS_SKIP_BOUNCER_IN_SCANNER=1)
+                                # Bouncer (Option A): only PASS candidates go to queue (can be disabled with MAGNUS_SKIP_BOUNCER_IN_SCANNER=1)
                                 to_bouncer += 1
                                 if self.trade.skip_bouncer_in_scanner:
                                     bouncer_ok = True
@@ -444,7 +444,7 @@ class MarketScanner(threading.Thread):
                                     self.candidate_queue.put_nowait(candidate)
                                     self._mark_enqueued(m_id, token_id)
                                     enqueued_this_round += 1
-                                    print(f"      → Kö: {full_title[:58]} @ {current_price:.2f}", flush=True)
+                                    print(f"      → Queue: {full_title[:58]} @ {current_price:.2f}", flush=True)
                                 except queue.Full:
                                     skip_queue_full += 1
 
@@ -455,7 +455,7 @@ class MarketScanner(threading.Thread):
                 except Exception as ev_err:
                     continue
 
-            # Formaterad sammanfattning – alltid synlig efter varje runda (flush så det inte fastnar i buffer)
+            # Formatted summary – always visible after each round (flush so it doesn't get stuck in buffer)
             parts = []
             if skip_scan: parts.append(f"scan={skip_scan}")
             if skip_price: parts.append(f"price={skip_price}")
@@ -469,7 +469,7 @@ class MarketScanner(threading.Thread):
 
             # region agent log
             try:
-                import json as _json  # lokal alias för debug-loggning
+                import json as _json  # local alias for debug logging
                 with open("/home/kim/agents/.cursor/debug-ed1d60.log", "a", encoding="utf-8") as _fdbg:
                     _fdbg.write(
                         _json.dumps(
@@ -505,20 +505,20 @@ class MarketScanner(threading.Thread):
 
             _f = lambda s: print(s, flush=True)
             _f("\n" + "─" * 60)
-            _f("📡 SCANNER – resultat (" + strategy + ")")
-            _f("   Hittade: " + str(n_events) + " events, " + str(to_bouncer) + " token(s) passerade pre-filter.")
+            _f("📡 SCANNER – result (" + strategy + ")")
+            _f("   Found: " + str(n_events) + " events, " + str(to_bouncer) + " token(s) passed pre-filter.")
             if enqueued_this_round > 0:
                 qsize = self.candidate_queue.qsize()
-                _f("   → Till analys (kön): " + str(enqueued_this_round) + " kandidat(er). War Room plockar nästa batch (kön har nu " + str(qsize) + ").")
+                _f("   → To analysis (queue): " + str(enqueued_this_round) + " candidate(s). War Room picks next batch (queue now has " + str(qsize) + ").")
             else:
                 why = []
                 if skip_dup: why.append("dup")
-                if skip_queue_full: why.append("kön full")
-                _f("   → Till analys: 0" + (" (" + ", ".join(why) + ")" if why else "") + ".")
+                if skip_queue_full: why.append("queue full")
+                _f("   → To analysis: 0" + (" (" + ", ".join(why) + ")" if why else "") + ".")
             if parts:
-                _f("   Filtrerade bort: " + ", ".join(parts))
+                _f("   Filtered out: " + ", ".join(parts))
             if to_bouncer == 0 and skip_price > 0:
-                _f("   Tip: många skippade på pris – kör med MAGNUS_VERBOSE_SCANNER=1 för att se exempel, eller sätt MIN/MAX_ENTRY_PRICE i .env.")
+                _f("   Tip: many skipped on price – run with MAGNUS_VERBOSE_SCANNER=1 to see examples, or set MIN/MAX_ENTRY_PRICE in .env.")
             _f("─" * 60)
             if self._stop.is_set():
                 return

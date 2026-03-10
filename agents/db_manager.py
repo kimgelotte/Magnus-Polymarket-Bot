@@ -207,7 +207,7 @@ class DatabaseManager:
             return False
 
     def delete_trade(self, trade_id: int | None = None, token_id: str | None = None) -> bool:
-        """Ta bort en trade (t.ex. phantom där ordern avbröts innan fill). Ange trade_id eller token_id."""
+        """Remove a trade (e.g. phantom where order was cancelled before fill). Specify trade_id or token_id."""
         if trade_id is None and not token_id:
             return False
         try:

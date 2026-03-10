@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-Magnus – återställ saknade GTC-säljordrar.
+Magnus – restore missing GTC sell orders.
 
-Om GTC-säljordrar har försvunnit (heartbeat avbruten, restart, etc.)
-kan du köra detta för att lägga tillbaka säljordrar vid target_price
-för alla öppna positioner som har andelar men ingen säljorder.
+If GTC sell orders have disappeared (heartbeat interrupted, restart, etc.)
+you can run this to add back sell orders at target_price
+for all open positions that have shares but no sell order.
 
-Användning:
+Usage:
     python -m scripts.python.restore_sell_orders
 """
 
@@ -27,7 +27,7 @@ def main() -> None:
 
     positions = db.get_open_positions()
     if not positions:
-        print("Inga öppna positioner.")
+        print("No open positions.")
         return
 
     balances = pm.get_all_token_balances()
@@ -44,7 +44,7 @@ def main() -> None:
         try:
             open_orders = pm.get_open_orders(asset_id=t_id)
             if open_orders is None:
-                print(f"   ⚠️ Kunde inte hämta ordrar för {t_id} – skippar")
+                print(f"   ⚠️ Could not fetch orders for {t_id} – skipping")
                 continue
             orders_list = (
                 open_orders.get("data", open_orders)
@@ -60,17 +60,17 @@ def main() -> None:
             )
 
             if not has_sell:
-                print(f"📤 Återställer GTC-sälj: {t['question'][:40]}… @ {target_price:.2f}")
+                print(f"📤 Restoring GTC sell: {t['question'][:40]}… @ {target_price:.2f}")
                 ok = pm.execute_sell_order(t_id, actual_balance, target_price)
                 if ok:
                     restored += 1
-                    print(f"   ✓ Placerad.")
+                    print(f"   ✓ Placed.")
                 else:
-                    print(f"   ⚠️ Misslyckades.")
+                    print(f"   ⚠️ Failed.")
         except Exception as e:
-            print(f"   ❌ Fel för {t_id}: {e}")
+            print(f"   ❌ Error for {t_id}: {e}")
 
-    print(f"\n✅ Återställde {restored} säljordrar.")
+    print(f"\n✅ Restored {restored} sell order(s).")
 
 
 if __name__ == "__main__":

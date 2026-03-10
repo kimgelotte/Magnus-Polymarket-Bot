@@ -1,10 +1,10 @@
 """
-Magnus V4 – Portfolio‑nivå risk.
+Magnus V4 – Portfolio-level risk.
 
-Trackar:
-- Peak‑saldo (USDC)
-- Drawdown i % från peak
-- Enkel korrelationskontroll per kategori för att undvika för många lika bets.
+Tracks:
+- Peak balance (USDC)
+- Drawdown in % from peak
+- Simple correlation check per category to avoid too many similar bets.
 """
 
 import os
@@ -31,7 +31,7 @@ class PortfolioRiskManager:
         self._load_peak()
 
     def _load_peak(self) -> None:
-        """Läs in historiskt peak‑saldo från loggfil, om den finns."""
+        """Load historical peak balance from log file, if it exists."""
         path = Path(BALANCE_LOG_PATH)
         if not path.exists():
             return
@@ -46,11 +46,11 @@ class PortfolioRiskManager:
                     if bal > self._peak_balance:
                         self._peak_balance = bal
         except Exception:
-            # Riskhantering får inte krascha botten.
+            # Risk management must not crash the app.
             pass
 
     def log_balance(self, balance: float) -> None:
-        """Logga saldo periodiskt (max en gång per 5 minuter)."""
+        """Log balance periodically (max once per 5 minutes)."""
         now = time.time()
         if now - self._last_balance_log < 300:
             return
@@ -74,9 +74,9 @@ class PortfolioRiskManager:
 
     def check_drawdown(self, current_balance: float) -> tuple[bool, float]:
         """
-        Returnerar (should_pause, drawdown_pct).
+        Returns (should_pause, drawdown_pct).
 
-        Pausar nya trades om drawdown > MAX_DRAWDOWN_PCT.
+        Pauses new trades if drawdown > MAX_DRAWDOWN_PCT.
         """
         if self._peak_balance <= 0:
             self._peak_balance = float(current_balance)
@@ -91,12 +91,12 @@ class PortfolioRiskManager:
 
     def check_correlation(self, new_event_title: str, new_category: str) -> bool:
         """
-        True om en ny position skulle göra oss för tungt exponerade i samma kategori.
+        True if a new position would over-expose us in the same category.
 
-        Enkel heuristik:
-        - Jämför titelord (>= 4 tecken) mellan ny kandidat och existerande trades i samma kategori.
-        - Om vi hittar minst två "shared" ord för en trade räknas den som korrelerad.
-        - Om antal korrelerade trades når MAX_CORRELATED_POSITIONS → blockera ny trade.
+        Simple heuristic:
+        - Compare title words (>= 4 chars) between new candidate and existing trades in same category.
+        - If we find at least two "shared" words for a trade it counts as correlated.
+        - If number of correlated trades reaches MAX_CORRELATED_POSITIONS → block new trade.
         """
         positions = self.db.get_open_positions()
         if not positions:

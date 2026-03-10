@@ -1,63 +1,63 @@
 ## Magnus – Polymarket Sniper Bot
 
-Magnus är en autonom trading‑agent för Polymarket.  
-Han handlar inte “up or down”, utan jagar **prisrörelser**: köpa billigt, sälja dyrare innan resolution.
+Magnus is an autonomous trading agent for Polymarket.  
+It does not trade "up or down", but hunts **price movements**: buy cheap, sell dear before resolution.
 
-### Struktur
+### Structure
 
-- `agents/application/trade.py` – huvudloopen (Sniper Mode, orderläggning, risk på trade‑nivå).
-- `agents/application/scanner.py` – scanner‑tråd som hittar kandidater och matar kön.
-- `agents/war_room.py` – “War Room”: Bouncer, Lawyer, Scout, Quant (AI‑beslutslogik).
-- `agents/polymarket/polymarket.py` – Polymarket‑klient (CLOB + Gamma API).
-- `agents/db_manager.py` – SQLite‑logg av trades och analyser.
-- `agents/risk_manager.py` – Kelly‑baserad sizing av bets.
-- `agents/portfolio_risk.py` – drawdown‑kontroll och enkel korrelationskontroll.
-- `agents/dynamic_target.py` – beräknar dynamiskt target‑pris för GTC‑sell.
-- `agents/observer.py` – enkel observer‑tråd för öppna positioner.
-- `scripts/python/cli.py` – CLI‑entrypoint (`python -m scripts.python.cli run-autonomous-trader`).
-- `scripts/revoke_polymarket_keys.py` – hjälpskript för att rotera Polymarket USER‑API‑nyckel via L1.
-- `.env` – lokala hemligheter (privatnyckel, API‑nycklar, inställningar). **Ska ALDRIG committas** – använd `.env.example` som mall.
+- `agents/application/trade.py` – main loop (Sniper Mode, order placement, trade-level risk).
+- `agents/application/scanner.py` – scanner thread that finds candidates and feeds the queue.
+- `agents/war_room.py` – "War Room": Bouncer, Lawyer, Scout, Quant (AI decision logic).
+- `agents/polymarket/polymarket.py` – Polymarket client (CLOB + Gamma API).
+- `agents/db_manager.py` – SQLite log of trades and analyses.
+- `agents/risk_manager.py` – Kelly-based bet sizing.
+- `agents/portfolio_risk.py` – drawdown control and simple correlation check.
+- `agents/dynamic_target.py` – computes dynamic target price for GTC sell.
+- `agents/observer.py` – simple observer thread for open positions.
+- `scripts/python/cli.py` – CLI entrypoint (`python -m scripts.python.cli run-autonomous-trader`).
+- `scripts/revoke_polymarket_keys.py` – helper script to rotate Polymarket USER API key via L1.
+- `.env` – local secrets (private key, API keys, settings). **NEVER commit** – use `.env.example` as template.
 
-### Krav
+### Requirements
 
-- Python 3.12 (virtuel miljö i `venv/` rekommenderas).
-- Node/npm **endast** för hjälpskript (t.ex. typescript‑verktyg) – inte för själva bottens runtime.
+- Python 3.12 (virtual env in `venv/` recommended).
+- Node/npm **only** for helper scripts (e.g. TypeScript tools) – not for the bot runtime.
 
-Installera Python‑beroenden (om inte redan gjort):
+Install Python dependencies (if not already done):
 
 ```bash
 cd /agents
 python3 -m venv venv
 source venv/bin/activate
-pip install -r requirements.txt   # om/ när requirements finns
+pip install -r requirements.txt   # if/when requirements exist
 ```
 
-### Miljövariabler (`.env`)
+### Environment variables (`.env`)
 
-Alla hemliga värden hålls **endast** i `.env` (som är ignorerad av `.gitignore`).
+All secret values are kept **only** in `.env` (which is ignored by `.gitignore`).
 
-För att komma igång:
+To get started:
 
-1. Kopiera mallen:
+1. Copy the template:
 
    ```bash
    cp .env.example .env
    ```
 
-2. Fyll i dina egna värden i `.env`:
-   - `PRIVATE_KEY` – privata nyckeln för bot‑walleten på Polygon.
-   - `POLYMARKET_FUNDER_ADDRESS` – adressen som håller USDC.e (samma som i Polymarket UI).
-   - `POLYGON_CONFIG_MAINNET_RPC_URL` – din egen Alchemy/Infura‑URL.
-   - AI‑nycklar: `OPENAI_API_KEY`, `DEEPSEEK_API_KEY`, `ANTHROPIC_API_KEY`, `XAI_API_KEY`, `TAVILY_API_KEY`, `NEWSAPI_API_KEY`.
+2. Fill in your own values in `.env`:
+   - `PRIVATE_KEY` – private key for the bot wallet on Polygon.
+   - `POLYMARKET_FUNDER_ADDRESS` – address that holds USDC.e (same as in Polymarket UI).
+   - `POLYGON_CONFIG_MAINNET_RPC_URL` – your own Alchemy/Infura URL.
+   - AI keys: `OPENAI_API_KEY`, `DEEPSEEK_API_KEY`, `ANTHROPIC_API_KEY`, `XAI_API_KEY`, `TAVILY_API_KEY`, `NEWSAPI_API_KEY`.
 
-3. Skapa CLOB USER‑API‑nycklar (L2) via SDK:
+3. Create CLOB USER API keys (L2) via SDK:
 
    ```bash
-   # från projektroten, med PRIVATE_KEY satt i .env
+   # from project root, with PRIVATE_KEY set in .env
    python -m scripts.python.create_polymarket_api_creds
    ```
 
-   Skriptet skriver ut:
+   The script outputs:
 
    ```json
    {
@@ -67,7 +67,7 @@ För att komma igång:
    }
    ```
 
-   Kopiera dessa värden in i `.env`:
+   Copy these values into `.env`:
 
    ```env
    USER_API_KEY=...
@@ -75,7 +75,7 @@ För att komma igång:
    USER_API_PASSPHRASE=...
    ```
 
-### Köra Magnus (Sniper Mode)
+### Running Magnus (Sniper Mode)
 
 ```bash
 cd /agents
@@ -83,9 +83,9 @@ source venv/bin/activate
 python3 -m scripts.python.cli run-autonomous-trader
 ```
 
-### Säkerhet
+### Security
 
-- **`.env`** är i `.gitignore` – committa aldrig denna fil.
-- Rotera alltid **privata nycklar** och API‑nycklar vid läckor.
-- Låt aldrig `.env` eller privata nycklar hamna i git eller på GitHub.
-- Använd en dedikerad bot‑wallet (inte din personliga huvudwallet) för Magnus.
+- **`.env`** is in `.gitignore` – never commit this file.
+- Always rotate **private keys** and API keys on leaks.
+- Never let `.env` or private keys end up in git or on GitHub.
+- Use a dedicated bot wallet (not your personal main wallet) for Magnus.

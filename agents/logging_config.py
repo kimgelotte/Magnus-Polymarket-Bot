@@ -4,15 +4,15 @@ from logging.handlers import RotatingFileHandler
 
 def setup_logging() -> None:
     """
-    Basloggning för Magnus.
+    Base logging for Magnus.
 
-    - Sätter root‑logger till INFO.
-    - Loggar både till stdout och till `magnus_structured.log` (roterande).
-    - Körs en gång i början av `Trade` via `setup_logging()`.
+    - Sets root logger to INFO.
+    - Logs to both stdout and `magnus_structured.log` (rotating).
+    - Run once at start of `Trade` via `setup_logging()`.
     """
     root = logging.getLogger()
     if root.handlers:
-        # Redan konfigurerad – undvik dubbel logging.
+        # Already configured – avoid double logging.
         return
 
     root.setLevel(logging.INFO)
@@ -35,10 +35,10 @@ def setup_logging() -> None:
         file_handler.setFormatter(formatter)
         root.addHandler(file_handler)
     except Exception:
-        # Loggning får aldrig krascha botten.
+        # Logging must never crash the app.
         pass
 
-    # Tona ned spam från tredjepart (httpx/py_clob_client etc.).
+    # Tone down spam from third party (httpx/py_clob_client etc.).
     for noisy in ("httpx", "py_clob_client", "urllib3"):
         try:
             logging.getLogger(noisy).setLevel(logging.WARNING)

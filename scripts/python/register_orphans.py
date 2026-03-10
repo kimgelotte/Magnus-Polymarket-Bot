@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-Magnus – registrera orphan-positioner i DB.
+Magnus – register orphan positions in DB.
 
-Hittar positioner vi äger on-chain (Polymarket) som inte finns i databasen,
-hämtar marknadsinfo via Gamma API, och loggar dem som trades med GTC-sälj.
+Finds positions we own on-chain (Polymarket) that are not in the database,
+fetches market info via Gamma API, and logs them as trades with GTC sell.
 
-Användning:
-    python -m scripts.python.register_orphans              # Dry-run (visa endast)
-    python -m scripts.python.register_orphans --apply       # Logga till DB + placera GTC-sälj
+Usage:
+    python -m scripts.python.register_orphans              # Dry-run (show only)
+    python -m scripts.python.register_orphans --apply       # Log to DB + place GTC sell
 """
 
 import argparse
@@ -27,23 +27,23 @@ from agents.dynamic_target import compute_dynamic_target
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="register_orphans",
-        description="Hitta och registrera orphan-positioner (on-chain men inte i DB)",
+        description="Find and register orphan positions (on-chain but not in DB)",
     )
     parser.add_argument(
         "--apply",
         action="store_true",
-        help="Logga till DB och placera GTC-sälj. Utan flagga: dry-run (visa endast).",
+        help="Log to DB and place GTC sell. Without flag: dry-run (show only).",
     )
     parser.add_argument(
         "--min-shares",
         type=float,
         default=5.0,
-        help="Minsta andelar för att räknas som position (default: 5, Polymarket-krav)",
+        help="Min shares to count as position (default: 5, Polymarket requirement)",
     )
     parser.add_argument(
         "--debug",
         action="store_true",
-        help="Visa diagnostik: antal positioner, öppna trades, filterlogik",
+        help="Show diagnostics: number of positions, open trades, filter logic",
     )
     args = parser.parse_args()
 
@@ -53,8 +53,8 @@ def main() -> None:
     open_trades = db.get_open_positions()
     open_token_ids = {str(t["token_id"]) for t in open_trades}
 
-    # För proxy: använd Data API som har full metadata (title, avgPrice, endDate)
-    # För EOA: använd get_all_token_balances + get_market_info_by_token_id
+    # For proxy: use Data API which has full metadata (title, avgPrice, endDate)
+    # For EOA: use get_all_token_balances + get_market_info_by_token_id
     has_funder = bool(getattr(pm, "_l2_funder_for_balance", None))
     positions_with_meta = pm.get_positions_with_metadata() if has_funder else []
 
@@ -64,32 +64,32 @@ def main() -> None:
         positions = pm.get_all_token_balances()
 
     if args.debug:
-        funder = getattr(pm, "_l2_funder_for_balance", None) or "ej satt (EOA)"
+        funder = getattr(pm, "_l2_funder_for_balance", None) or "not set (EOA)"
         print(f"DEBUG: POLYMARKET_FUNDER_ADDRESS = {funder}")
         print(f"DEBUG: {len(positions)} positioner")
         for tid, bal in list(positions.items())[:10]:
-            in_db = "i DB" if tid in open_token_ids else "ej i DB"
+            in_db = "in DB" if tid in open_token_ids else "not in DB"
             print(f"  {tid[:28]}… bal={bal:.2f} {in_db}")
         if len(positions) > 10:
-            print(f"  … och {len(positions) - 10} till")
-        print(f"DEBUG: {len(open_trades)} öppna trades i DB")
+            print(f"  … and {len(positions) - 10} more")
+        print(f"DEBUG: {len(open_trades)} open trades in DB")
         print("-" * 60)
 
     orphans = []
     for token_id, balance in positions.items():
         if balance < args.min_shares or token_id in open_token_ids:
             continue
-        # Hitta metadata: från Data API (positions_with_meta) eller Gamma
+        # Find metadata: from Data API (positions_with_meta) or Gamma
         meta = next((p for p in positions_with_meta if str(p.get("asset")) == str(token_id)), None)
         orphans.append((token_id, balance, meta))
 
     if not orphans:
-        print("Inga orphan-positioner hittades.")
+        print("No orphan positions found.")
         if args.debug and positions:
-            print("  (Positioner finns men alla är antingen < min_shares eller redan i DB)")
+            print("  (Positions exist but all are either < min_shares or already in DB)")
         return
 
-    print(f"Hittade {len(orphans)} orphan(s):")
+    print(f"Found {len(orphans)} orphan(s):")
     print("-" * 60)
 
     for token_id, balance, meta in orphans:
@@ -110,7 +110,7 @@ def main() -> None:
         else:
             info = pm.get_market_info_by_token_id(token_id)
             if not info:
-                print(f"  ⚠️ {token_id[:24]}… ({balance:.1f} shares) – kunde inte hämta marknadsinfo")
+                print(f"  ⚠️ {token_id[:24]}… ({balance:.1f} shares) – could not fetch market info")
                 continue
             full_title = info.get("question", "")
             group = info.get("groupItemTitle", "")
@@ -175,15 +175,15 @@ def main() -> None:
                 )
                 ok = pm.execute_sell_order(token_id, balance, target_price)
                 if ok:
-                    print(f"    ✅ Loggad + GTC-sälj placerad @ {target_price:.2f}")
+                    print(f"    ✅ Logged + GTC sell placed @ {target_price:.2f}")
                 else:
-                    print(f"    ⚠️ Loggad men GTC-sälj misslyckades – kör restore-sell-orders")
+                    print(f"    ⚠️ Logged but GTC sell failed – run restore-sell-orders")
             except Exception as e:
-                print(f"    ❌ Fel: {e}")
+                print(f"    ❌ Error: {e}")
 
     if orphans and not args.apply:
         print("-" * 60)
-        print("Kör med --apply för att logga till DB och placera GTC-säljordrar.")
+        print("Run with --apply to log to DB and place GTC sell orders.")
 
 
 if __name__ == "__main__":

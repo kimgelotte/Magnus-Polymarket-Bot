@@ -1,13 +1,13 @@
 """
-Dynamic target‑prissättning för Magnus.
+Dynamic target pricing for Magnus.
 
-Beräknar vilket GTC‑säljpris vi ska lägga in givet:
+Computes which GTC sell price to place given:
 - fill_price
 - days_until_end
-- range_pct (historisk volatilitet)
-- hype_score (Scout‑output)
+- range_pct (historical volatility)
+- hype_score (Scout output)
 - spread_pct
-- ai_max_price (Quant‑max)
+- ai_max_price (Quant max)
 """
 
 from __future__ import annotations
@@ -35,7 +35,7 @@ def compute_dynamic_target(
     price_high_threshold: float,
 ) -> float:
     """
-    Returnerar target‑pris (decimal 0–1) för GTC‑sell order.
+    Returns target price (decimal 0–1) for GTC sell order.
     """
     fill_price = _safe_float(fill_price)
     ai_max_price = _safe_float(ai_max_price, default=0.0)
@@ -48,11 +48,11 @@ def compute_dynamic_target(
 
     target_pct = base_target_pct
 
-    # Billiga entries → använd högre grundmål.
+    # Cheap entries → use higher base target.
     if fill_price < price_high_threshold:
         target_pct = high_target_pct
 
-    # Volatilitet: större range → lite högre mål, låg range → lägre.
+    # Volatility: larger range → slightly higher target, low range → lower.
     if range_pct > 30:
         target_pct += 0.03
     elif range_pct > 20:
@@ -66,7 +66,7 @@ def compute_dynamic_target(
     elif hype <= 3:
         target_pct -= 0.02
 
-    # Tid kvar: väldigt lite tid → var mer aggressiv (lägre target).
+    # Time left: very little time → be more aggressive (lower target).
     if days_until_end is not None:
         d = _safe_float(days_until_end)
         if d < 1.0:
@@ -74,23 +74,23 @@ def compute_dynamic_target(
         elif d > 7.0:
             target_pct += 0.01
 
-    # Spread: hög spread → kräver högre pris för att kompensera friktion.
+    # Spread: high spread → requires higher price to compensate friction.
     if spread_pct_f is not None:
         if spread_pct_f > 15:
             target_pct += 0.02
         elif spread_pct_f < 5:
             target_pct -= 0.005
 
-    # Sätt golv/tak på target‑procent.
+    # Set floor/ceiling on target percent.
     target_pct = max(0.03, min(target_pct, 0.40))
 
     target_price = fill_price * (1.0 + target_pct)
 
-    # Hårdkapa mot Quant‑max om den är satt (>0).
+    # Hard cap against Quant max if set (>0).
     if ai_max_price > 0:
         target_price = min(target_price, ai_max_price)
 
-    # Säkerställ att target > fill med margin.
+    # Ensure target > fill with margin.
     if target_price <= fill_price * 1.02:
         target_price = fill_price * 1.02
 

@@ -6,12 +6,12 @@ import threading
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 
-# Lås för att undvika interleaving när flera marknader analyseras parallellt
+# Lock to avoid interleaving when multiple markets are analysed in parallel
 _print_lock = threading.Lock()
 
 
 def _print_block(*args, **kwargs):
-    """Thread-safe print som håller varje marknadsblock sammanhängande."""
+    """Thread-safe print that keeps each market block coherent."""
     with _print_lock:
         print(*args, **kwargs)
 
@@ -26,9 +26,9 @@ class MagnusWarRoom:
         "We use PRICE PATTERNS – where price sits in its historical range (high/low/avg) – to TIME entry: "
         "buy when price is relatively LOW in the range, sell when it has moved UP toward our target."
     )
-    LAWYER_RULES_MAX_LEN = 500  # Trunkera rules för att spara tokens; titel + inledande text räcker för PASS/FAIL
+    LAWYER_RULES_MAX_LEN = 500  # Truncate rules to save tokens; title + opening text suffices for PASS/FAIL
 
-    # Kort hint per kategori: vad som räknas som katalysator – används i Scout för tydlig analysgrund
+    # Short hint per category: what counts as catalyst – used in Scout for clear analysis basis
     CATALYST_HINTS = {
         "Sports": "Catalyst = injury/lineup news, result, form; use LIVE RESEARCH for recent reports.",
         "Crypto": "Catalyst = price move, meme/sentiment, ETF/regulation news; use LIVE RESEARCH for momentum.",
@@ -48,21 +48,21 @@ class MagnusWarRoom:
         "Unknown": "Catalyst = whatever can move price for this market; use LIVE RESEARCH to find it.",
     }
 
-    # Extra sökord per kategori för Tavily/NewsAPI – ger mer relevant research
+    # Extra search terms per category for Tavily/NewsAPI – yields more relevant research
     CATEGORY_SEARCH_HINTS = {
         "Sports": "news injury lineup result",
         "Crypto": "price sentiment",
         "Earnings": "earnings report date",
         "Economics": "Fed data release",
         "Geopolitics": "news development",
-        "Weather": "forecast",  # Open-Meteo används separat; Tavily som komplement
+        "Weather": "forecast",  # Open-Meteo used separately; Tavily as complement
     }
 
     def __init__(self):
         load_dotenv()
-        # Default 1: skippa Lawyer så fler når Scout/Quant; sätt 0 för att köra Lawyer (stramare regler).
+        # Default 1: skip Lawyer so more reach Scout/Quant; set 0 to run Lawyer (stricter rules).
         self.skip_lawyer = os.getenv("MAGNUS_SKIP_LAWYER", "1").strip().lower() in ("1", "true", "yes")
-        # 1 = skippa Tavily/NewsAPI (sparar 5–15s per marknad – snabbare till köp)
+        # 1 = skip Tavily/NewsAPI (saves 5–15s per market – faster to buy)
         self.skip_research = os.getenv("MAGNUS_SKIP_RESEARCH", "0").strip().lower() in ("1", "true", "yes")
         self.xai_key = os.getenv("XAI_API_KEY")
         self.ds_key = os.getenv("DEEPSEEK_API_KEY")
@@ -236,7 +236,7 @@ class MagnusWarRoom:
         query = (question or "").strip()[:300]
         if not query:
             return ""
-        # Kategori-medveten query: lägg till sökord som ger mer relevant research
+        # Category-aware query: add search terms for more relevant research
         hint = self.CATEGORY_SEARCH_HINTS.get(category, "")
         search_query = f"{query} {hint}".strip() if hint else query
         tavily_task = self._fetch_tavily(search_query, max_results=4)
@@ -286,7 +286,7 @@ class MagnusWarRoom:
                 if resp.status_code != 200:
                     body = resp.text
                     if resp.status_code == 429 or "rate limit" in (body or "").lower() or "insufficient" in (body or "").lower():
-                        _print_block("   ⚠️ Bouncer API: rate limit eller slut på krediter (Grok). PASS för att inte blocka.")
+                        _print_block("   ⚠️ Bouncer API: rate limit or out of credits (Grok). PASS to avoid blocking.")
                     return False
                 return "PASS" in (resp.json() or {}).get("choices", [{}])[0].get("message", {}).get("content", "").strip().upper()
         except httpx.TimeoutException:
@@ -296,7 +296,7 @@ class MagnusWarRoom:
             return False
 
     async def _claude_lawyer(self, question: str, rules: str, category: str = "Unknown") -> dict:
-        """Step 2: Lawyer. Lätt regelkoll: tradable + tydlig resolution. Returnerar {passed, criteria_summary}."""
+        """Step 2: Lawyer. Light rule check: tradable + clear resolution. Returns {passed, criteria_summary}."""
         rules_short = (rules or "").strip()[: self.LAWYER_RULES_MAX_LEN]
         if (rules or "").strip() and len((rules or "").strip()) > self.LAWYER_RULES_MAX_LEN:
             rules_short = rules_short.rstrip() + "…"
@@ -322,7 +322,7 @@ class MagnusWarRoom:
                 if resp.status_code != 200:
                     body = (resp.text or "").lower()
                     if resp.status_code == 429 or "rate limit" in body or "overloaded" in body or "insufficient" in body:
-                        _print_block("   ⚠️ Lawyer API: rate limit eller slut på krediter (Claude). FAIL för denna kandidat.")
+                        _print_block("   ⚠️ Lawyer API: rate limit or out of credits (Claude). FAIL for this candidate.")
                     return {"passed": False, "criteria_summary": ""}
                 data = resp.json()
                 text = (data.get("content") or [{}])[0].get("text", "").strip()
@@ -478,7 +478,7 @@ class MagnusWarRoom:
                 if resp.status_code != 200:
                     body = (resp.text or "").lower()
                     if resp.status_code == 429 or "rate limit" in body or "insufficient" in body:
-                        _print_block("   ⚠️ Scout API: rate limit eller slut på krediter (Grok). Använder score 5.")
+                        _print_block("   ⚠️ Scout API: rate limit or out of credits (Grok). Using score 5.")
                     return default_out
                 text = resp.json().get("choices", [{}])[0].get("message", {}).get("content", "").strip()
                 score, summary = 5, ""
@@ -546,7 +546,7 @@ class MagnusWarRoom:
         url = "https://api.deepseek.com/chat/completions"
         headers = {"Authorization": f"Bearer {self.ds_key}", "Content-Type": "application/json"}
         specific_logic = self.LOGIC_ENGINE.get(category, self.LOGIC_ENGINE["Unknown"])
-        # Lätta på agenten: högre spread_cap så vi REJECT:ar färre pga spread; Quant väger in edge.
+        # Ease on agent: higher spread_cap so we REJECT fewer due to spread; Quant weighs in edge.
         spread_cap = 20 if uncertain_market else 25
         if category in ("Crypto", "Geopolitics", "Elections"):
             spread_cap = 28 if uncertain_market else 35
@@ -568,7 +568,7 @@ class MagnusWarRoom:
         )
         if uncertain_market:
             prompt += "Uncertain market: require clear edge and reasonable spread. For Geopolitics, Crypto and Earnings: require especially clear edge in an uncertain market, but do NOT auto-reject just because price is near recent highs if catalyst/momentum clearly support further upside.\n"
-        # Viktigt för Magnus: pris nära taket = varningsflagg, inte auto-REJECT.
+        # Important for Magnus: price near ceiling = warning flag, not auto-REJECT.
         prompt += (
             "IMPORTANT: Do NOT automatically REJECT just because the current price is near the historical high. "
             "If there is strong catalyst, momentum or news (especially in Crypto and Geopolitics) and a realistic path for the price to move further up before resolution, it can still be a BUY – just set MAX_PRICE to a conservative, sellable level that buyers might actually pay.\n\n"
@@ -623,7 +623,7 @@ class MagnusWarRoom:
                         else:
                             err_str = (err if isinstance(err, str) else str(err))[:120]
                         if "insufficient balance" in err_str.lower() or "insufficient_balance" in err_str.lower():
-                            return {"action": "REJECT", "max_price": 0.0, "reason": "Quant API: DeepSeek-kontot har slut på krediter – sätt in på platform.deepseek.com"}
+                            return {"action": "REJECT", "max_price": 0.0, "reason": "Quant API: DeepSeek account out of credits – top up at platform.deepseek.com"}
                         return {"action": "REJECT", "max_price": 0.0, "reason": f"API Error: {err_str}"}
                     raw = body.get("choices", [{}])[0].get("message", {}).get("content") or ""
                     result = raw.strip()
@@ -689,13 +689,13 @@ class MagnusWarRoom:
         if self.skip_lawyer:
             _print_block(f"   ⚖️ Lawyer: skipped (MAGNUS_SKIP_LAWYER)")
 
-        # Live research (Tavily + NewsAPI + för vädermarknader: Open-Meteo-prognos) som indata till Scout
+        # Live research (Tavily + NewsAPI + for weather markets: Open-Meteo forecast) as input to Scout
         research_snippet = "" if self.skip_research else await self._fetch_research_snippet(q, category, market_data.get("end_date"))
         if self.skip_research:
-            _print_block(f"   📡 Research: skipped (MAGNUS_SKIP_RESEARCH) – snabbare till köp.")
+            _print_block(f"   📡 Research: skipped (MAGNUS_SKIP_RESEARCH) – faster to buy.")
         if research_snippet:
             if self._is_weather_market(q, category) and "Open-Meteo" in research_snippet:
-                _print_block(f"   📡 Live research inkl. väderprognos (Open-Meteo) till Scout.")
+                _print_block(f"   📡 Live research incl. weather forecast (Open-Meteo) to Scout.")
             else:
                 _print_block(f"   📡 Live research (Tavily/NewsAPI) included in Scout.")
 
@@ -703,7 +703,7 @@ class MagnusWarRoom:
         hype = await self._grok_radar(q, category, research_snippet=research_snippet)
         _print_block(f"   🔥 Hype Score: {hype['score']}/10")
 
-        # Quant (volatility, time left, price context) – samla i en kompakt rad
+        # Quant (volatility, time left, price context) – gather in a compact line
         similar_analyses = (market_data.get("similar_analyses") or "").strip()
         days_until_end = market_data.get("days_until_end")
         price_context = market_data.get("price_context") or {}

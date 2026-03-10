@@ -2,17 +2,17 @@
 One-off helper script to rotate Polymarket USER API credentials.
 
 It uses the L1 `create_api_key()` method on `ClobClient`:
-- Per Polymarket docs, varje wallet kan bara ha EN aktiv API-nyckel åt gången.
-- Att skapa en ny nyckel gör den gamla ogiltig.
+- Per Polymarket docs, each wallet can only have ONE active API key at a time.
+- Creating a new key invalidates the old one.
 
-Krav:
-- Körs i samma miljö som Magnus (så PRIVATE_KEY och Python-deps finns).
+Requirements:
+- Run in same environment as Magnus (so PRIVATE_KEY and Python deps exist).
 
-Användning:
+Usage:
     cd /home/kim/agents
     python scripts/revoke_polymarket_keys.py
 
-Scriptet skriver ut nya USER_* värden, som du sedan klistrar in i .env.
+Script outputs new USER_* values, which you then paste into .env.
 """
 
 import os
@@ -22,7 +22,7 @@ from py_clob_client.client import ClobClient
 
 
 def main() -> None:
-    # Ladda .env så PRIVATE_KEY och övriga variabler finns i environment.
+    # Load .env so PRIVATE_KEY and other variables are in environment.
     load_dotenv()
 
     host = "https://clob.polymarket.com"
@@ -30,15 +30,15 @@ def main() -> None:
 
     private_key = os.getenv("PRIVATE_KEY")
     if not private_key:
-        print("❌ PRIVATE_KEY saknas i environment – kan inte skapa ny API-nyckel.")
+        print("❌ PRIVATE_KEY missing in environment – cannot create new API key.")
         return
 
     print("🚨 Rotating Polymarket USER API key via L1 create_or_derive_api_key() …")
     client = ClobClient(host=host, chain_id=chain_id, key=private_key)
 
     try:
-        # Försök först med create_or_derive_api_key (hämtar befintlig eller skapar ny),
-        # fallback till create_api_key om äldre version av klienten.
+        # Try first with create_or_derive_api_key (fetches existing or creates new),
+        # fallback to create_api_key if older client version.
         if hasattr(client, "create_or_derive_api_key"):
             api_creds = client.create_or_derive_api_key()
         else:
@@ -47,7 +47,7 @@ def main() -> None:
         print(f"❌ create_api_key() failed: {e}")
         return
 
-    # api_creds kan vara ett objekt eller en dict – hantera båda.
+    # api_creds can be an object or dict – handle both.
     def _get(field: str) -> str:
         if hasattr(api_creds, field):
             return str(getattr(api_creds, field))
@@ -60,7 +60,7 @@ def main() -> None:
     passphrase = _get("passphrase")
 
     if not key or not secret or not passphrase:
-        print(f"❌ Fick oväntat svar från create_api_key(): {api_creds!r}")
+        print(f"❌ Got unexpected response from create_api_key(): {api_creds!r}")
         return
 
     print("\n✅ New USER API credentials created.\n")
@@ -68,7 +68,7 @@ def main() -> None:
     print(f"USER_API_KEY={key}")
     print(f"USER_SECRET={secret}")
     print(f"USER_PASSPHRASE={passphrase}\n")
-    print("Efter att du uppdaterat .env, starta om Magnus så han använder de nya nycklarna.")
+    print("After updating .env, restart Magnus so it uses the new keys.")
 
 
 if __name__ == "__main__":

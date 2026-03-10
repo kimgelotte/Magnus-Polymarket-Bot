@@ -5,11 +5,11 @@ from typing import Iterable, Optional
 
 class MagnusObserver(threading.Thread):
     """
-    Minimal observer/stub för realtidsövervakning.
+    Minimal observer/stub for real-time monitoring.
 
-    Originalet använde websockets mot Polymarket; här håller vi bara koll på
-    vilka token_ids som är aktiva och exponerar samma gränssnitt så att
-    `Trade.manage_active_trades` och snipern kan köras utan fel.
+    Original used websockets against Polymarket; here we just track
+    which token_ids are active and expose the same interface so
+    `Trade.manage_active_trades` and sniper can run without error.
     """
 
     def __init__(self, token_ids: Iterable[str], trade_manager) -> None:
@@ -18,7 +18,7 @@ class MagnusObserver(threading.Thread):
         self.trade_manager = trade_manager
         self._token_ids = {str(tid) for tid in token_ids if tid}
 
-    # API som används från Trade
+    # API used from Trade
 
     def add_token(
         self,
@@ -34,7 +34,7 @@ class MagnusObserver(threading.Thread):
 
     def sync_from_db(self) -> None:
         """
-        Synka internt token‑set från DB – vi gör det enkelt och hämtar bara om.
+        Sync internal token set from DB – we keep it simple and just re-fetch.
         """
         try:
             trades = self.trade_manager.db.get_open_positions()
@@ -47,7 +47,7 @@ class MagnusObserver(threading.Thread):
     def stop(self) -> None:
         self._stop.set()
 
-    # Thread‑loop: gör inget tungt; kan utökas med websockets i framtiden.
+    # Thread loop: does nothing heavy; can be extended with websockets in future.
 
     def run(self) -> None:
         while not self._stop.is_set():

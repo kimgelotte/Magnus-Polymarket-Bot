@@ -1,7 +1,7 @@
 """
-Magnus CLI – huvudentrépunkt.
+Magnus CLI – main entry point.
 
-Vanligaste kommandot:
+Most common command:
 
     python -m scripts.python.cli run-autonomous-trader
 """
@@ -14,9 +14,9 @@ from agents.polymarket.polymarket import Polymarket
 
 
 def check_orders_cmd(argv: list[str] | None = None) -> None:
-    """Lista öppna ordrar från CLOB – kanonisk källa även om polymarket.com/portfolio inte visar dem."""
+    """List open orders from CLOB – canonical source even if polymarket.com/portfolio doesn't show them."""
     import argparse
-    parser = argparse.ArgumentParser(prog="magnus check-orders", description="Lista öppna ordrar från CLOB")
+    parser = argparse.ArgumentParser(prog="magnus check-orders", description="List open orders from CLOB")
     args = parser.parse_args(argv or [])
 
     pm = Polymarket()
@@ -25,10 +25,10 @@ def check_orders_cmd(argv: list[str] | None = None) -> None:
 
     print(f"Proxy (POLYMARKET_FUNDER_ADDRESS): {funder}")
     if orders is None:
-        print("Öppna ordrar (CLOB): Kunde inte hämta (API-fel)")
+        print("Open orders (CLOB): Could not fetch (API error)")
         orders = []
     else:
-        print(f"Öppna ordrar (CLOB): {len(orders)}")
+        print(f"Open orders (CLOB): {len(orders)}")
     print("─" * 50)
     for o in orders[:15]:
         side = o.get("side", "?")
@@ -41,45 +41,45 @@ def check_orders_cmd(argv: list[str] | None = None) -> None:
         asset = str(o.get("asset_id", "?"))[:24]
         print(f"  {side} @ {price}  size≈{sz}  token={asset}...")
     if not orders:
-        print("  (Inga öppna ordrar)")
+        print("  (No open orders)")
     else:
         print("─" * 50)
-        print("Om polymarket.com/portfolio?tab=Open+orders är tom: CLOB har ordrarna. De är aktiva.")
+        print("If polymarket.com/portfolio?tab=Open+orders is empty: CLOB has the orders. They are active.")
 
 
 def restore_sell_orders_cmd() -> None:
-    """Återställ saknade GTC-säljordrar för öppna positioner."""
+    """Restore missing GTC sell orders for open positions."""
     from scripts.python.restore_sell_orders import main as restore_main
     restore_main()
 
 
 def mark_sell_active_cmd() -> None:
-    """Markera alla öppna positioner som att de har GTC-säljordrar (t.ex. placerade manuellt på polymarket.com)."""
+    """Mark all open positions as having GTC sell orders (e.g. placed manually on polymarket.com)."""
     db = DatabaseManager()
     n = db.mark_open_positions_sell_active()
-    print(f"✅ Markerade {n} öppna positioner som att de har GTC-säljordrar i boken.")
+    print(f"✅ Marked {n} open position(s) as having GTC sell orders on book.")
 
 
 def run_autonomous_trader() -> None:
-    """Startar Magnus V4 Sniper‑loopen."""
+    """Starts Magnus V4 Sniper loop."""
     trade = Trade()
     trade.run_sniper_loop()
 
 
 def delete_trade_cmd(argv: list[str] | None = None) -> None:
-    """Ta bort en phantom-trade (order loggad men innehavet fanns aldrig)."""
-    parser = argparse.ArgumentParser(prog="magnus delete-trade", description="Ta bort trade från DB")
-    parser.add_argument("--id", type=int, help="Trade-id att ta bort")
-    parser.add_argument("--token-id", type=str, help="Token-id att ta bort")
-    parser.add_argument("--list-open", action="store_true", help="Lista öppna positioner")
-    parser.add_argument("--list-all", type=int, nargs="?", metavar="N", const=15, help="Lista senaste N trades (default 15)")
+    """Remove a phantom trade (order logged but inventory never existed)."""
+    parser = argparse.ArgumentParser(prog="magnus delete-trade", description="Remove trade from DB")
+        parser.add_argument("--id", type=int, help="Trade id to remove")
+        parser.add_argument("--token-id", type=str, help="Token id to remove")
+        parser.add_argument("--list-open", action="store_true", help="List open positions")
+        parser.add_argument("--list-all", type=int, nargs="?", metavar="N", const=15, help="List last N trades (default 15)")
     args = parser.parse_args(argv or [])
 
     db = DatabaseManager()
     if args.list_all is not None:
         trades = db.get_all_trades(limit=args.list_all)
         if not trades:
-            print("Inga trades.")
+            print("No trades.")
         else:
             for t in trades:
                 print(f"  id={t['id']} status={t['status']} {str(t.get('question',''))[:50]}...")
@@ -87,7 +87,7 @@ def delete_trade_cmd(argv: list[str] | None = None) -> None:
     if args.list_open:
         positions = db.get_open_positions()
         if not positions:
-            print("Inga öppna positioner.")
+            print("No open positions.")
         else:
             for p in positions:
                 print(f"  id={p['id']} token_id={p['token_id'][:24]}... {p.get('question','')[:50]}...")
@@ -98,13 +98,13 @@ def delete_trade_cmd(argv: list[str] | None = None) -> None:
     elif args.token_id:
         ok = db.delete_trade(token_id=args.token_id)
     else:
-        print("Ange --id N eller --token-id XXX. Använd --list-open för att se öppna.")
+        print("Specify --id N or --token-id XXX. Use --list-open to see open.")
         raise SystemExit(1)
 
     if ok:
-        print(f"✅ Trade borttagen.")
+        print(f"✅ Trade removed.")
     else:
-        print("❌ Kunde inte ta bort (id/token hittades inte).")
+        print("❌ Could not remove (id/token not found).")
         raise SystemExit(1)
 
 
@@ -115,7 +115,7 @@ def main() -> None:
         "command",
         nargs="?",
         default="run-autonomous-trader",
-        help="Vilket kommando som ska köras (default: run-autonomous-trader)",
+        help="Which command to run (default: run-autonomous-trader)",
     )
     args, remaining = parser.parse_known_args()
 
@@ -137,10 +137,10 @@ def main() -> None:
             from scripts.python.register_orphans import main as _reg_main
             _reg_main()
         else:
-            raise SystemExit(f"Okänt kommando: {cmd}")
+            raise SystemExit(f"Unknown command: {cmd}")
     except KeyboardInterrupt:
         # Snyggt avbrott vid Ctrl+C utan full traceback.
-        print("\n👋 Magnus avbruten med Ctrl+C – stänger ner.")
+        print("\n👋 Magnus interrupted with Ctrl+C – shutting down.")
 
 
 if __name__ == "__main__":
